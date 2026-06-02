@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.vectorstores import VectorStore
+# from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,8 +19,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # region ---------------- Settings ----------------
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
-CHROMA_DIR = PROJECT_DIR / ".chroma" / "rag_simple"
-COLLECTION_NAME = "langy_rag_simple"
+CHROMA_DIR = PROJECT_DIR / ".chroma" / "rag_junior"
+COLLECTION_NAME = "langy_rag_junior"
 
 SOURCE_URLS = [
     "https://lilianweng.github.io/posts/2023-06-23-agent/",
@@ -35,7 +37,7 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # region ---------------- Helpers ----------------
 def configure_environment() -> None:
     load_dotenv(str(ENV_PATH))
-    os.environ.setdefault("USER_AGENT", "langy-rag-simple/0.1")
+    os.environ.setdefault("USER_AGENT", "langy-rag-junior/0.1")
 
 
 def require_env(env_name: str) -> str:
@@ -46,7 +48,7 @@ def require_env(env_name: str) -> str:
 
 
 def parse_json_response(response_content: Any) -> dict[str, Any]:
-    """Simple level: use json.loads + a small fallback instead of Pydantic."""
+    """Junior level: use json.loads + a small fallback instead of Pydantic."""
 
     response_text = response_content if isinstance(response_content, str) else str(response_content)
     try:
@@ -73,7 +75,7 @@ def load_web_documents(source_urls: list[str]) -> list[Document]:
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
-        page_text = soup.get_text(separator="\n", strip=True)
+        page_text = "\n".join(soup.stripped_strings)
         documents.append(Document(page_content=page_text, metadata={"source": url_value}))
 
     return documents
@@ -85,7 +87,7 @@ def create_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, show_progress=False)
 
 
-def build_or_load_vectorstore(*, rebuild: bool = False) -> Chroma:
+def build_or_load_vectorstore(*, rebuild: bool = False) -> VectorStore:
     embeddings = create_embeddings()
     vectorstore = Chroma(
         collection_name=COLLECTION_NAME,
@@ -102,12 +104,19 @@ def build_or_load_vectorstore(*, rebuild: bool = False) -> Chroma:
 
     raw_documents = load_web_documents(SOURCE_URLS)
 
-    # Simple level: no overlap. Overlap appears later in rag_middle.py.
+    # Junior level: no overlap. Overlap appears later in rag_middle.py.
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=0)
     split_documents = splitter.split_documents(raw_documents)
 
     # Chroma stores document vectors on disk in CHROMA_DIR.
     vectorstore.add_documents(split_documents)
+
+    # Easy switch for an in-memory demo:
+    # memory_vectorstore = InMemoryVectorStore.from_documents(
+    #     documents=split_documents,
+    #     embedding=embeddings,
+    # )
+    # return memory_vectorstore
     return vectorstore
 # endregion
 
@@ -132,7 +141,7 @@ def format_documents(documents: list[Document]) -> str:
     return "\n\n".join(chunks)
 
 
-def run_rag_simple(user_question: str, *, rebuild_index: bool = False) -> dict[str, Any]:
+def run_rag_junior(user_question: str, *, rebuild_index: bool = False) -> dict[str, Any]:
     configure_environment()
     vectorstore = build_or_load_vectorstore(rebuild=rebuild_index)
 

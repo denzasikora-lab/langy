@@ -6,13 +6,13 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.vectorstores import VectorStore
 # from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -122,10 +122,11 @@ def build_or_load_vectorstore(*, rebuild: bool = False) -> VectorStore:
 
 
 # region ---------------- RAG ----------------
-def create_chat_model() -> ChatOllama:
+def create_chat_model():
     ollama_headers = {"Authorization": f"Bearer {require_env('OLLAMA_API_KEY')}"}
-    return ChatOllama(
-        model=os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud"),
+    return init_chat_model(
+        os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud"),
+        model_provider="ollama",
         temperature=0,
         format="json",
         base_url=os.environ.get("OLLAMA_HOST", "https://ollama.com"),

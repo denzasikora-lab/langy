@@ -14,8 +14,7 @@ def run_langy(level: int, question: str = DEFAULT_QUESTION) -> dict[str, Any] | 
     if level == 1:
         return run_rag_junior(question)
     if level == 2:
-        run_rag_middle()
-        return None
+        return run_rag_middle(question)
     if level == 3:
         run_rag_senior()
         return None

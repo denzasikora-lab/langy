@@ -1,11 +1,16 @@
 beautifulsoup4
 chromadb
+faiss-cpu
+langchain
 langchain-chroma
 langchain-core
 langchain-huggingface
 langchain-ollama
+langchain-openai
 langchain-text-splitters
+langgraph
+langsmith
+numpy
 python-dotenv
 requests
 sentence-transformers
-

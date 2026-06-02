@@ -1,0 +1,11 @@
+beautifulsoup4
+chromadb
+langchain-chroma
+langchain-core
+langchain-huggingface
+langchain-ollama
+langchain-text-splitters
+python-dotenv
+requests
+sentence-transformers
+

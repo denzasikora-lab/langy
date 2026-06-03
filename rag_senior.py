@@ -26,6 +26,7 @@
 """
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -50,7 +51,10 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pydantic import BaseModel, Field
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, ConfigDict, Field
+from sentence_transformers import CrossEncoder
 
 
 # region ---------------- Settings ----------------
@@ -72,10 +76,14 @@ HYBRID_TOP_K = 20
 RERANK_TOP_K = 5
 MIN_GRADED_DOCS = 2
 SENIOR_CONTEXT_CHAR_BUDGET = 180_000
+MAX_CORRECTION_ATTEMPTS = 2
 
 BGE_M3_MODEL = "BAAI/bge-m3"
 MINILM_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
 SeniorStore = Literal["qdrant", "weaviate"]
+AfterGradingNode = Literal["fallback_web_search", "build_context"]
+AfterHallucinationNode = Literal["self_correct_answer", "__end__"]
 # endregion
 
 
@@ -179,6 +187,24 @@ class SeniorHybridIndex:
             for doc_index, score_value in scores[:top_k]
             if score_value > 0
         ]
+
+
+class SeniorGraphState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    question: str
+    store: SeniorStore
+    mcp_tool_names: list[str] = Field(default_factory=list)
+    anonymized_question: AnonymizedText | None = None
+    hyde_text: str = ""
+    hybrid_index: SeniorHybridIndex | None = None
+    candidates: list[RetrievalCandidate] = Field(default_factory=list)
+    graded_candidates: list[RetrievalCandidate] = Field(default_factory=list)
+    fallback_documents: list[Document] = Field(default_factory=list)
+    context_text: str = ""
+    answer: SeniorAnswer | None = None
+    hallucination_grade: HallucinationGrade | None = None
+    correction_attempts: int = 0
 # endregion
 
 
@@ -203,6 +229,29 @@ def create_chat_model():
         api_key=require_env("OPENAI_API_KEY"),
         base_url=os.environ.get("OPENAI_BASE_URL"),
     )
+
+
+async def load_mcp_tool_names() -> list[str]:
+    """Load MCP tools when LANGY_MCP_CONNECTIONS_JSON is configured.
+
+    Example env shape:
+    {"docs":{"transport":"stdio","command":"python","args":["/abs/path/server.py"]}}
+    """
+
+    connections_json = os.environ.get("LANGY_MCP_CONNECTIONS_JSON")
+    if not connections_json:
+        return []
+
+    try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
+        client = MultiServerMCPClient(json.loads(connections_json))
+        tools = await client.get_tools()
+        if hasattr(client, "close"):
+            await client.close()
+        return [tool_item.name for tool_item in tools]
+    except Exception as error:
+        return [f"mcp_unavailable:{type(error).__name__}"]
 # endregion
 
 
@@ -442,6 +491,16 @@ def document_key(document: Document) -> tuple[str, int]:
 
 
 # region ---------------- HyDE / rerank / graders ----------------
+_RERANKER: CrossEncoder | None = None
+
+
+def get_reranker() -> CrossEncoder:
+    global _RERANKER
+    if _RERANKER is None:
+        _RERANKER = CrossEncoder(RERANKER_MODEL)
+    return _RERANKER
+
+
 async def generate_hyde_document(question_text: str) -> str:
     llm = create_chat_model()
     prompt = f"""
@@ -461,11 +520,28 @@ Question:
 
 
 async def rerank_candidates(question_text: str, candidates: list[RetrievalCandidate]) -> list[RetrievalCandidate]:
-    query_terms = set(tokenize(question_text))
-    for candidate in candidates:
-        doc_terms = set(tokenize(candidate.document.page_content))
-        lexical_overlap = len(query_terms & doc_terms) / max(len(query_terms), 1)
-        candidate.rerank_score = 0.55 * candidate.hybrid_score + 0.45 * lexical_overlap
+    def rerank_sync() -> list[float]:
+        reranker = get_reranker()
+        pairs = [
+            [question_text, candidate.document.page_content[:4000]]
+            for candidate in candidates
+        ]
+        scores = reranker.predict(pairs)
+        return [float(score_value) for score_value in scores]
+
+    try:
+        rerank_scores = await asyncio.to_thread(rerank_sync)
+    except Exception:
+        # Fallback остается детерминированным, если локальный reranker не скачался/не загрузился.
+        query_terms = set(tokenize(question_text))
+        rerank_scores = []
+        for candidate in candidates:
+            doc_terms = set(tokenize(candidate.document.page_content))
+            lexical_overlap = len(query_terms & doc_terms) / max(len(query_terms), 1)
+            rerank_scores.append(0.55 * candidate.hybrid_score + 0.45 * lexical_overlap)
+
+    for candidate, score_value in zip(candidates, rerank_scores, strict=False):
+        candidate.rerank_score = score_value
     return sorted(candidates, key=lambda item: item.rerank_score, reverse=True)[:RERANK_TOP_K]
 
 
@@ -610,23 +686,158 @@ Question:
 # endregion
 
 
+# region ---------------- LangGraph ----------------
+def build_senior_graph() -> CompiledStateGraph:
+    async def load_mcp_tools_node(state: SeniorGraphState) -> dict[str, Any]:
+        return {"mcp_tool_names": await load_mcp_tool_names()}
+
+    async def anonymize_question_node(state: SeniorGraphState) -> dict[str, Any]:
+        return {"anonymized_question": anonymize_text(state.question)}
+
+    async def generate_hyde_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before HyDE")
+        return {"hyde_text": await generate_hyde_document(state.anonymized_question.anonymized)}
+
+    async def retrieve_hybrid_node(state: SeniorGraphState) -> dict[str, Any]:
+        hybrid_index = await build_hybrid_index(state.store)
+        candidates = await hybrid_index.search(state.hyde_text)
+        return {"hybrid_index": hybrid_index, "candidates": candidates}
+
+    async def rerank_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before rerank")
+        return {"candidates": await rerank_candidates(state.anonymized_question.anonymized, state.candidates)}
+
+    async def grade_documents_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before grading")
+        return {"graded_candidates": await grade_documents(state.anonymized_question.anonymized, state.candidates)}
+
+    def decide_after_grading(state: SeniorGraphState) -> AfterGradingNode:
+        if len(state.graded_candidates) < MIN_GRADED_DOCS:
+            return "fallback_web_search"
+        return "build_context"
+
+    async def fallback_web_search_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before fallback")
+        fallback_documents = await fallback_web_search(state.anonymized_question.anonymized)
+        fallback_candidates = [
+            RetrievalCandidate(document=document, hybrid_score=0.0, rerank_score=0.0)
+            for document in fallback_documents
+        ]
+        return {
+            "fallback_documents": fallback_documents,
+            "graded_candidates": state.graded_candidates + fallback_candidates,
+        }
+
+    async def build_context_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before context build")
+        return {
+            "context_text": build_context(
+                state.anonymized_question.anonymized,
+                state.hyde_text,
+                state.graded_candidates,
+            )
+        }
+
+    async def generate_answer_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None:
+            raise RuntimeError("anonymized_question is required before answer generation")
+        return {"answer": await generate_answer(state.anonymized_question.anonymized, state.context_text)}
+
+    async def grade_hallucination_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.answer is None:
+            raise RuntimeError("answer is required before hallucination grading")
+        return {"hallucination_grade": await grade_hallucination(state.answer, state.context_text)}
+
+    def decide_after_hallucination(state: SeniorGraphState) -> AfterHallucinationNode:
+        if (
+            state.hallucination_grade
+            and not state.hallucination_grade.grounded
+            and state.correction_attempts < MAX_CORRECTION_ATTEMPTS
+        ):
+            return "self_correct_answer"
+        return "__end__"
+
+    async def self_correct_answer_node(state: SeniorGraphState) -> dict[str, Any]:
+        if state.anonymized_question is None or state.answer is None or state.hallucination_grade is None:
+            raise RuntimeError("question, answer, and hallucination_grade are required before self-correction")
+        corrected_answer = await self_correct_answer(
+            state.anonymized_question.anonymized,
+            state.context_text,
+            state.answer,
+            state.hallucination_grade,
+        )
+        return {
+            "answer": corrected_answer,
+            "correction_attempts": state.correction_attempts + 1,
+        }
+
+    graph_builder = StateGraph(SeniorGraphState)
+    graph_builder.add_node("load_mcp_tools", load_mcp_tools_node)
+    graph_builder.add_node("anonymize_question", anonymize_question_node)
+    graph_builder.add_node("generate_hyde", generate_hyde_node)
+    graph_builder.add_node("retrieve_hybrid", retrieve_hybrid_node)
+    graph_builder.add_node("rerank_bge", rerank_node)
+    graph_builder.add_node("grade_documents", grade_documents_node)
+    graph_builder.add_node("fallback_web_search", fallback_web_search_node)
+    graph_builder.add_node("build_context", build_context_node)
+    graph_builder.add_node("generate_answer", generate_answer_node)
+    graph_builder.add_node("grade_hallucination", grade_hallucination_node)
+    graph_builder.add_node("self_correct_answer", self_correct_answer_node)
+
+    graph_builder.add_edge(START, "load_mcp_tools")
+    graph_builder.add_edge("load_mcp_tools", "anonymize_question")
+    graph_builder.add_edge("anonymize_question", "generate_hyde")
+    graph_builder.add_edge("generate_hyde", "retrieve_hybrid")
+    graph_builder.add_edge("retrieve_hybrid", "rerank_bge")
+    graph_builder.add_edge("rerank_bge", "grade_documents")
+    graph_builder.add_conditional_edges(
+        "grade_documents",
+        decide_after_grading,
+        {
+            "fallback_web_search": "fallback_web_search",
+            "build_context": "build_context",
+        },
+    )
+    graph_builder.add_edge("fallback_web_search", "build_context")
+    graph_builder.add_edge("build_context", "generate_answer")
+    graph_builder.add_edge("generate_answer", "grade_hallucination")
+    graph_builder.add_conditional_edges(
+        "grade_hallucination",
+        decide_after_hallucination,
+        {
+            "self_correct_answer": "self_correct_answer",
+            "__end__": END,
+        },
+    )
+    graph_builder.add_edge("self_correct_answer", "grade_hallucination")
+    return graph_builder.compile()
+# endregion
+
+
 # region ---------------- Diagrams and entrypoint ----------------
 def save_senior_diagram(store: SeniorStore) -> None:
     store_label = "Qdrant mode" if store == "qdrant" else "Weaviate mode"
     mermaid_text = f"""
 flowchart TD
-    q["User question"] --> pii["PII anonymization: NER + regex masks"]
+    start["START"] --> mcp["MCP bootstrap / external tools"]
+    mcp --> pii["PII anonymization: NER + regex masks"]
     pii --> hyde["HyDE pseudo-document"]
-    hyde --> emb["Embedding ensemble"]
-    emb --> ret["{store_label}: semantic top_k=20 + BM25 top_k=20"]
-    ret --> merge["Hybrid merge"]
-    merge --> rerank["Reranker top_k=5"]
-    rerank --> grade["Grader yes/no"]
-    grade --> fallback["Fallback web search if no good docs"]
-    fallback --> ctx["Context builder"]
+    hyde --> ret["{store_label}: semantic top_k=20 + BM25 top_k=20"]
+    ret --> rerank["BAAI/bge-reranker-base top_k=5"]
+    rerank --> grade["Document grader yes/no"]
+    grade -->|enough good docs| ctx["Context builder"]
+    grade -->|not enough docs| fallback["Fallback web search"]
+    fallback --> ctx
     ctx --> gen["LLM generation >64k context"]
     gen --> hall["Hallucination grader"]
-    hall --> fix["Optional self-correction"]
+    hall -->|grounded or max attempts| done["END"]
+    hall -->|not grounded| fix["Self-correction"]
+    fix --> hall
 """
     save_mermaid_assets(DIAGRAM_DIR / f"rag_senior_{store}_graph", mermaid_text)
 
@@ -639,32 +850,26 @@ async def run_rag_senior(
     configure_environment()
     require_env("OPENAI_API_KEY")
     await asyncio.to_thread(save_senior_diagram, store)
-    print(f"[langy] level=senior store={store} async=true hybrid=semantic+bm25 rerank_top_k={RERANK_TOP_K}")
+    print(f"[langy] level=senior store={store} async=true graph=langgraph mcp=optional reranker={RERANKER_MODEL}")
 
-    anonymized_question = anonymize_text(user_question)
-    hyde_text = await generate_hyde_document(anonymized_question.anonymized)
-    hybrid_index = await build_hybrid_index(store)
-    candidates = await hybrid_index.search(hyde_text)
-    reranked_candidates = await rerank_candidates(anonymized_question.anonymized, candidates)
-    graded_candidates = await grade_documents(anonymized_question.anonymized, reranked_candidates)
-
-    fallback_documents: list[Document] = []
-    if len(graded_candidates) < MIN_GRADED_DOCS:
-        fallback_documents = await fallback_web_search(anonymized_question.anonymized)
-        graded_candidates.extend(
-            RetrievalCandidate(document=document, hybrid_score=0.0, rerank_score=0.0)
-            for document in fallback_documents
-        )
-
-    context_text = build_context(anonymized_question.anonymized, hyde_text, graded_candidates)
-    answer = await generate_answer(anonymized_question.anonymized, context_text)
-    hallucination_grade = await grade_hallucination(answer, context_text)
-    corrected_answer = await self_correct_answer(
-        anonymized_question.anonymized,
-        context_text,
-        answer,
-        hallucination_grade,
+    graph = build_senior_graph()
+    result_state = await graph.ainvoke({"question": user_question, "store": store})
+    answer = result_state.get("answer") or SeniorAnswer(
+        answer="No answer produced.",
+        sources=[],
+        model_confidence=0.0,
     )
+    hallucination_grade = result_state.get("hallucination_grade") or HallucinationGrade(
+        grounded=False,
+        reason="No hallucination grade produced.",
+    )
+    anonymized_question = result_state.get("anonymized_question") or AnonymizedText(
+        original=user_question,
+        anonymized=user_question,
+        pii_map={},
+    )
+    graded_candidates = result_state.get("graded_candidates", [])
+    fallback_documents = result_state.get("fallback_documents", [])
 
     retrieved_sources = [
         str(candidate.document.metadata.get("source", "unknown"))
@@ -675,12 +880,13 @@ async def run_rag_senior(
         "store": store,
         "pipeline": [
             "pii_anonymization",
+            "mcp_bootstrap",
             "hyde",
             "embedding_ensemble",
             "semantic_top_20",
             "bm25_top_20",
             "hybrid_merge",
-            "rerank_top_5",
+            "bge_reranker_top_5",
             "grader_yes_no",
             "fallback_web_search",
             "context_builder",
@@ -689,10 +895,12 @@ async def run_rag_senior(
             "self_correction_optional",
         ],
         "pii_masks": list(anonymized_question.pii_map),
-        "hyde_preview": hyde_text[:500],
+        "mcp_tool_names": result_state.get("mcp_tool_names", []),
+        "hyde_preview": result_state.get("hyde_text", "")[:500],
         "retrieved_chunk_sources": retrieved_sources,
         "retrieved_sources": list(dict.fromkeys(retrieved_sources)),
         "fallback_used": bool(fallback_documents),
+        "correction_attempts": result_state.get("correction_attempts", 0),
         "hallucination_grounded": hallucination_grade.grounded,
         "hallucination_reason": hallucination_grade.reason,
     }

@@ -5,6 +5,7 @@ langchain
 langchain-chroma
 langchain-core
 langchain-huggingface
+langchain-mcp-adapters
 langchain-ollama
 langchain-openai
 langchain-text-splitters

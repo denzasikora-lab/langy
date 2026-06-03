@@ -10,6 +10,7 @@
 - скачали страницы -> нарезали дефолтным splitter без тонкой настройки;
 - вопрос пользователя тоже превращается в вектор;
 - retriever сравнивает вектор вопроса с векторами чанков;
+- LLM-as-a-judge reranker сортирует найденные чанки по полезности;
 - лучшие чанки идут в LLM как контекст.
 """
 
@@ -87,8 +88,9 @@ def save_junior_diagram() -> None:
 flowchart TD
     q["User question"] --> r["InMemoryVectorStore retriever"]
     r --> c["Default top-k chunks"]
-    c --> m["Ollama via init_chat_model"]
-    m --> j["JSON parsing"]
+    c --> judge["LLM-as-a-judge reranker"]
+    judge --> m["Ollama via init_chat_model"]
+    m --> json["JSON parsing"]
 """
     save_mermaid_assets(GRAPH_STEM, mermaid_text)
 # endregion
@@ -146,6 +148,43 @@ def format_documents(documents: list[Document]) -> str:
     return "\n\n".join(chunks)
 
 
+def rerank_with_llm_judge(
+    *,
+    llm,
+    user_question: str,
+    documents: list[Document],
+) -> list[Document]:
+    scored_documents: list[tuple[float, int, Document]] = []
+    for index_value, document in enumerate(documents, start=1):
+        judge_prompt = f"""
+Question:
+{user_question}
+
+Chunk:
+{document.page_content[:3000]}
+
+Return JSON only:
+{{"score": 0.0, "reason": "..."}}
+
+Score means how useful this chunk is for answering the question.
+"""
+        response = llm.invoke(
+            [
+                SystemMessage(content="You are a strict retrieval judge."),
+                HumanMessage(content=judge_prompt),
+            ]
+        )
+        score_payload = parse_json_response(response.content)
+        try:
+            score_value = float(score_payload.get("score", 0.0))
+        except (TypeError, ValueError):
+            score_value = 0.0
+        scored_documents.append((score_value, index_value, document))
+
+    scored_documents.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return [document for _, _, document in scored_documents]
+
+
 def run_rag_junior(user_question: str) -> dict[str, Any]:
     configure_environment()
     save_junior_diagram()
@@ -158,18 +197,24 @@ def run_rag_junior(user_question: str) -> dict[str, Any]:
         retriever = vectorstore.as_retriever()
         retrieved_documents = retriever.invoke(user_question)
 
+        llm = create_chat_model()
+        reranked_documents = rerank_with_llm_judge(
+            llm=llm,
+            user_question=user_question,
+            documents=retrieved_documents,
+        )
+
         prompt = f"""
 Answer the user question using only the context.
 Return JSON only:
 {{"answer": "...", "sources": ["..."]}}
 
 Context:
-{format_documents(retrieved_documents)}
+{format_documents(reranked_documents)}
 
 Question:
 {user_question}
 """
-        llm = create_chat_model()
         response = llm.invoke(
             [
                 SystemMessage(content="You are a precise RAG assistant."),
@@ -178,7 +223,8 @@ Question:
         )
 
     result = parse_json_response(response.content)
-    retrieved_sources = [document.metadata.get("source", "unknown") for document in retrieved_documents]
+    retrieved_sources = [document.metadata.get("source", "unknown") for document in reranked_documents]
+    result["reranker"] = "llm_as_a_judge"
     result["retrieved_chunk_sources"] = retrieved_sources
     result["retrieved_sources"] = list(dict.fromkeys(retrieved_sources))
     return result

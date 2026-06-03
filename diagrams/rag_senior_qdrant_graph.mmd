@@ -1,0 +1,7 @@
+
+flowchart TD
+    q["User question"] --> e["Embedding ensemble"]
+    e --> v["Qdrant vector search"]
+    v --> r["Reranker / filters"]
+    r --> a["Answer synthesis"]
+    a --> ev["Evaluation + observability"]

@@ -1,0 +1,7 @@
+
+flowchart TD
+    q["User question"] --> r["Chroma MMR: fetch_k=10"]
+    r --> m["MMR selects k=3 diverse chunks"]
+    m --> c["Build context"]
+    c --> g["LangGraph generate_answer"]
+    g --> p["Pydantic structured output"]

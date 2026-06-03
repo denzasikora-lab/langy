@@ -11,6 +11,7 @@ langchain-text-splitters
 langgraph
 langsmith
 numpy
+pydantic
 python-dotenv
 requests
 sentence-transformers

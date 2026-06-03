@@ -13,12 +13,17 @@ DEFAULT_LEVEL = 1
 def run_langy(level: int, question: str = DEFAULT_QUESTION) -> dict[str, Any] | None:
     if level == 1:
         return run_rag_junior(question)
-    if level == 2:
-        return run_rag_middle(question)
-    if level == 3:
-        run_rag_senior()
+    if level == 21:
+        return run_rag_middle(question, store="chroma")
+    if level == 22:
+        return run_rag_middle(question, store="faiss")
+    if level == 31:
+        run_rag_senior(store="qdrant")
         return None
-    raise ValueError("level must be 1 (junior), 2 (middle), or 3 (senior)")
+    if level == 32:
+        run_rag_senior(store="weaviate")
+        return None
+    raise ValueError("level must be 1, 21, 22, 31, or 32")
 
 
 def main() -> None:

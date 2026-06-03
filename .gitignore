@@ -1,6 +1,7 @@
 .env
 .chroma/
 .faiss/
+.idea/
 __pycache__/
 .pytest_cache/
 .DS_Store

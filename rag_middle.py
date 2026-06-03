@@ -12,6 +12,7 @@
 Архитектура:
 - скачали страницы -> нарезали с overlap -> сохранили в Chroma/FAISS;
 - MMR берет fetch_k=10 кандидатов и выбирает k=3 более разных чанка;
+- lambda_mult=0.5 держит баланс между similarity и diversity;
 - LangGraph передает состояние между узлами retrieve_context и generate_answer;
 - LLM возвращает ответ в Pydantic-схему MiddleAnswer.
 """

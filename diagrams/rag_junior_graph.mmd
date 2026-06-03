@@ -1,6 +1,0 @@
-
-flowchart TD
-    q["User question"] --> r["InMemoryVectorStore retriever"]
-    r --> c["Default top-k chunks"]
-    c --> m["Ollama via init_chat_model"]
-    m --> j["JSON parsing"]

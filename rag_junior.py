@@ -7,7 +7,7 @@
 - JSON без Pydantic: простая ручная проверка ответа.
 
 Архитектура:
-- скачали страницы -> нарезали без overlap -> положили в память;
+- скачали страницы -> нарезали дефолтным splitter без тонкой настройки;
 - вопрос пользователя тоже превращается в вектор;
 - retriever сравнивает вектор вопроса с векторами чанков;
 - лучшие чанки идут в LLM как контекст.
@@ -49,7 +49,6 @@ SOURCE_URLS = [
     "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
 ]
 
-CHUNK_SIZE = 1000
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # endregion
 
@@ -118,6 +117,7 @@ def create_embeddings() -> HuggingFaceEmbeddings:
 
 def build_vectorstore() -> VectorStore:
     raw_documents = load_web_documents(SOURCE_URLS)
+    # Junior-уровень: не трогаем chunk_size/chunk_overlap, чтобы не смешивать темы.
     splitter = RecursiveCharacterTextSplitter()
     split_documents = splitter.split_documents(raw_documents)
     embeddings = create_embeddings()

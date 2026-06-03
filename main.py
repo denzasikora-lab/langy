@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -18,11 +19,9 @@ def run_langy(level: int, question: str = DEFAULT_QUESTION) -> dict[str, Any] | 
     if level == 22:
         return run_rag_middle(question, store="faiss")
     if level == 31:
-        run_rag_senior(store="qdrant")
-        return None
+        return asyncio.run(run_rag_senior(question, store="qdrant"))
     if level == 32:
-        run_rag_senior(store="weaviate")
-        return None
+        return asyncio.run(run_rag_senior(question, store="weaviate"))
     raise ValueError("level must be 1, 21, 22, 31, or 32")
 
 

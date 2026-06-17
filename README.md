@@ -1,14 +1,15 @@
 # Langy
 
-Langy is a small RAG playground that grows in three steps:
+Langy is a small RAG playground that grows in four steps:
 
 - `rag_junior.py` - level `1`, InMemoryVectorStore, default splitter settings, LLM-as-a-judge reranker, JSON parsing, and Ollama via `init_chat_model`.
 - `rag_middle.py` - level `21`, Chroma + MMR; level `22`, FAISS + MMR. Both use LangGraph router, simple tool calling, vectorstore/web-search branches, rerank eval metrics, Pydantic outputs, LangSmith, and OpenAI via `init_chat_model`.
-- `rag_senior.py` - level `31`, Qdrant-oriented async senior graph; level `32`, Weaviate-oriented async senior graph. Both use optional MCP tools, PII anonymization, HyDE, hybrid retrieval, BGE reranking, graders, fallback, hallucination checks, loops, and embedding ensembling.
+- `rag_senior.py` - level `31`, Weaviate-oriented async senior graph; level `32`, Qdrant-oriented async senior graph with optional PostgreSQL/pgvector sync. Both use optional MCP tools, PII anonymization, HyDE, hybrid retrieval, BGE reranking, graders, fallback, hallucination checks, loops, and embedding ensembling.
+- `rag_staff.py` - level `41`, staff RAG over Qdrant with LightRAG-style graph retrieval, LlamaIndex-style hierarchical ingestion, tool-map routing, context expansion, BGE+Qwen reranking, and optional CatBoostRanker.
 
 ## Current Status
 
-`rag_junior.py`, `rag_middle.py`, and `rag_senior.py` are implemented now.
+`rag_junior.py`, `rag_middle.py`, `rag_senior.py`, and `rag_staff.py` are implemented now.
 
 ## Project Layout
 
@@ -18,6 +19,7 @@ langy/
   rag_junior.py
   rag_middle.py
   rag_senior.py
+  rag_staff.py
   README.md
   requirements.txt
   .env.example
@@ -43,6 +45,11 @@ OPENAI_MODEL=gpt-4.1-mini
 LANGSMITH_API_KEY=your_langsmith_api_key
 LANGY_MIDDLE_LANGSMITH_PROJECT=langy-rag-middle
 LANGY_MCP_CONNECTIONS_JSON=
+QDRANT_URL=
+QDRANT_API_KEY=
+QDRANT_COLLECTION=langy_staff_41
+POSTGRES_CONNECTION_STRING=
+LANGY_PGVECTOR_COLLECTION=langy_senior_32
 USER_AGENT=langy-rag-junior/0.1
 ```
 
@@ -53,8 +60,9 @@ USER_AGENT=langy-rag-junior/0.1
 - `1` - junior, InMemoryVectorStore, JSON, default splitter settings
 - `21` - middle, Chroma + MMR, `k=3`, `fetch_k=10`, `lambda_mult=0.5`
 - `22` - middle, FAISS + MMR, `k=3`, `fetch_k=10`, `lambda_mult=0.5`
-- `31` - senior, Qdrant-oriented async LangGraph RAG
-- `32` - senior, Weaviate-oriented async LangGraph RAG
+- `31` - senior, Weaviate-oriented async LangGraph RAG
+- `32` - senior, Qdrant-oriented async LangGraph RAG with optional PostgreSQL/pgvector sync
+- `41` - staff, Qdrant-oriented LightRAG/LlamaIndex-style graph RAG
 
 For now the default is level `1`:
 
@@ -62,7 +70,7 @@ For now the default is level `1`:
 python3 main.py
 ```
 
-To switch levels, call `run_langy(1)`, `run_langy(21)`, `run_langy(22)`, `run_langy(31)`, or `run_langy(32)`.
+To switch levels, call `run_langy(1)`, `run_langy(21)`, `run_langy(22)`, `run_langy(31)`, `run_langy(32)`, or `run_langy(41)`.
 The script entrypoint currently uses `DEFAULT_LEVEL`:
 
 ```python
@@ -111,6 +119,21 @@ DEFAULT_LEVEL = 1
 10. Builds a controlled context for a model with a context window greater than 64k.
 11. Generates the answer and checks hallucinations.
 12. If the answer is not grounded, self-corrects and loops back to hallucination grading.
+
+## How `rag_staff.py` Works
+
+1. Routes the request through a structured Pydantic tool-map: vectorstore, web, summarise, translate, human pause, or txt2sql.
+2. Uses HyDE before retrieval so semantic search runs against a cleaner hypothetical target document.
+3. Loads html/json/markdown/code/pdf documents.
+4. Builds parent-child hierarchical chunks: large parent chunks preserve context; small child chunks improve retrieval precision.
+5. Vectorizes chunk text together with metadata labels and source type.
+6. Builds a LightRAG-style entity graph over chunks.
+7. Uploads vectors to Qdrant when `QDRANT_URL` is configured, otherwise uses the local fallback index.
+8. Retrieves with cosine top_k=20 and BM25 top_k=20, then hybrid-merges candidates.
+9. Expands context through neighboring chunks only when cosine continuity is high enough.
+10. Repairs broken next/previous navigation by checking nearby chunks in the same parent.
+11. Reranks with BGE and Qwen3 rerankers, then merges both rankings.
+12. Uses CatBoostRanker only when enough labeled ranking data exists in `staff_ltr_training.json`.
 
 ## Diagrams
 

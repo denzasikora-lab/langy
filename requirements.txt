@@ -1,4 +1,5 @@
 beautifulsoup4
+catboost
 chromadb
 faiss-cpu
 langchain
@@ -8,12 +9,18 @@ langchain-huggingface
 langchain-mcp-adapters
 langchain-ollama
 langchain-openai
+langchain-postgres
 langchain-text-splitters
 langgraph
 langsmith
+lightrag-hku
+llama-index-core
 numpy
 ollama
+psycopg[binary]
 pydantic
+pypdf
 python-dotenv
+qdrant-client
 requests
 sentence-transformers

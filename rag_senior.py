@@ -1,8 +1,8 @@
 """Senior RAG: асинхронный production-shaped pipeline.
 
 Стек:
-- level 31: Qdrant-oriented режим.
-- level 32: Weaviate-oriented режим.
+- level 31: Weaviate-oriented режим.
+- level 32: Qdrant-oriented режим.
 - async/await: все публичные шаги pipeline асинхронные.
 - PII anonymization: NER-like detector + regex-фильтр + синтетические маски.
 - HyDE: LLM сначала пишет гипотетический документ, потом ищем по нему.
@@ -195,6 +195,7 @@ class SeniorGraphState(BaseModel):
     question: str
     store: SeniorStore
     mcp_tool_names: list[str] = Field(default_factory=list)
+    pgvector_status: str = "pgvector_not_used"
     anonymized_question: AnonymizedText | None = None
     hyde_text: str = ""
     hybrid_index: SeniorHybridIndex | None = None
@@ -229,6 +230,40 @@ def create_chat_model():
         api_key=require_env("OPENAI_API_KEY"),
         base_url=os.environ.get("OPENAI_BASE_URL"),
     )
+
+
+async def maybe_sync_pgvector_index(index: SeniorHybridIndex) -> str:
+    connection_string = os.environ.get("POSTGRES_CONNECTION_STRING")
+    if not connection_string:
+        return "pgvector_not_configured"
+
+    def sync_pgvector() -> str:
+        try:
+            from langchain_postgres import PGVector
+
+            embeddings = HuggingFaceEmbeddings(model_name=BGE_M3_MODEL, show_progress=False)
+            documents = [
+                Document(
+                    page_content=document.page_content,
+                    metadata={
+                        **document.metadata,
+                        "senior_backend": "qdrant_plus_pgvector",
+                    },
+                )
+                for document in index.documents
+            ]
+            vectorstore = PGVector(
+                embeddings=embeddings,
+                collection_name=os.environ.get("LANGY_PGVECTOR_COLLECTION", "langy_senior_32"),
+                connection=connection_string,
+                use_jsonb=True,
+            )
+            vectorstore.add_documents(documents)
+            return "pgvector_synced"
+        except Exception as error:
+            return f"pgvector_unavailable:{type(error).__name__}"
+
+    return await asyncio.to_thread(sync_pgvector)
 
 
 async def load_mcp_tool_names() -> list[str]:
@@ -702,7 +737,10 @@ def build_senior_graph() -> CompiledStateGraph:
     async def retrieve_hybrid_node(state: SeniorGraphState) -> dict[str, Any]:
         hybrid_index = await build_hybrid_index(state.store)
         candidates = await hybrid_index.search(state.hyde_text)
-        return {"hybrid_index": hybrid_index, "candidates": candidates}
+        pgvector_status = "pgvector_not_used"
+        if state.store == "qdrant":
+            pgvector_status = await maybe_sync_pgvector_index(hybrid_index)
+        return {"hybrid_index": hybrid_index, "candidates": candidates, "pgvector_status": pgvector_status}
 
     async def rerank_node(state: SeniorGraphState) -> dict[str, Any]:
         if state.anonymized_question is None:
@@ -876,7 +914,7 @@ async def run_rag_senior(
         for candidate in graded_candidates
     ]
     return {
-        **corrected_answer.model_dump(),
+        **answer.model_dump(),
         "store": store,
         "pipeline": [
             "pii_anonymization",
@@ -896,6 +934,7 @@ async def run_rag_senior(
         ],
         "pii_masks": list(anonymized_question.pii_map),
         "mcp_tool_names": result_state.get("mcp_tool_names", []),
+        "pgvector_status": result_state.get("pgvector_status", "pgvector_not_used"),
         "hyde_preview": result_state.get("hyde_text", "")[:500],
         "retrieved_chunk_sources": retrieved_sources,
         "retrieved_sources": list(dict.fromkeys(retrieved_sources)),

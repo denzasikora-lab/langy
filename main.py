@@ -5,6 +5,7 @@ from typing import Any
 from rag_junior import run_rag_junior
 from rag_middle import run_rag_middle
 from rag_senior import run_rag_senior
+from rag_staff import run_rag_staff
 
 
 DEFAULT_QUESTION = "What are the types of agent memory?"
@@ -19,10 +20,12 @@ def run_langy(level: int, question: str = DEFAULT_QUESTION) -> dict[str, Any] | 
     if level == 22:
         return run_rag_middle(question, store="faiss")
     if level == 31:
-        return asyncio.run(run_rag_senior(question, store="qdrant"))
-    if level == 32:
         return asyncio.run(run_rag_senior(question, store="weaviate"))
-    raise ValueError("level must be 1, 21, 22, 31, or 32")
+    if level == 32:
+        return asyncio.run(run_rag_senior(question, store="qdrant"))
+    if level == 41:
+        return asyncio.run(run_rag_staff(question))
+    raise ValueError("level must be 1, 21, 22, 31, 32, or 41")
 
 
 def main() -> None:

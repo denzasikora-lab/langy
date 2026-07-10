@@ -1,20 +1,20 @@
-"""Middle RAG: уровень, где появляется настоящая RAG-архитектура.
+"""Middle RAG: the level where real RAG architecture appears.
 
-Стек:
+Stack:
 - level 21: Chroma vector store + MMR retrieval.
-- level 22: FAISS vector store + ручной MMR retrieval.
-- BAAI/bge-m3: embeddings на 1024 измерения.
-- LangGraph: явный граф шагов retrieve -> generate.
-- Pydantic: структурированный ответ модели.
-- LangSmith: tracing включается только в этом файле.
-- OpenAI-compatible chat model через init_chat_model.
+- level 22: FAISS vector store + manual MMR retrieval.
+- BAAI/bge-m3: 1024-dimensional embeddings.
+- LangGraph: explicit retrieve -> generate graph.
+- Pydantic: structured model response.
+- LangSmith: tracing is enabled only in this file.
+- OpenAI-compatible chat model via init_chat_model.
 
-Архитектура:
-- скачали страницы -> нарезали с overlap -> сохранили в Chroma/FAISS;
-- MMR берет fetch_k=10 кандидатов и выбирает k=3 более разных чанка;
-- lambda_mult=0.5 держит баланс между similarity и diversity;
-- LangGraph передает состояние между узлами retrieve_context и generate_answer;
-- LLM возвращает ответ в Pydantic-схему MiddleAnswer.
+Architecture:
+- download pages -> split with overlap -> save in Chroma/FAISS;
+- MMR takes fetch_k=10 candidates and chooses k=3 more diverse chunks;
+- lambda_mult=0.5 balances similarity and diversity;
+- LangGraph passes state between retrieve_context and generate_answer nodes;
+- LLM returns a response using the MiddleAnswer Pydantic schema.
 """
 
 import asyncio
@@ -268,7 +268,7 @@ def mmr_score(
     query_scores: np.ndarray,
     lambda_mult: float,
 ) -> float:
-    # MMR - это режим поиска: балансируем близость к вопросу и непохожесть выбранных чанков.
+    # MMR is a retrieval mode: balance closeness to the question and diversity among selected chunks.
     if not selected_positions:
         diversity_penalty = 0.0
     else:
@@ -277,7 +277,7 @@ def mmr_score(
     return float(lambda_mult * query_scores[position] - (1.0 - lambda_mult) * diversity_penalty)
 
 
-TOKEN_PATTERN = re.compile(r"[a-zA-Zа-яА-Я0-9_]+")
+TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 
 
 def tokenize(text: str) -> list[str]:

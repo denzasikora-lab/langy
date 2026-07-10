@@ -1,21 +1,21 @@
-"""Staff RAG: уровень 41, экспериментальная архитектура поверх Qdrant.
+"""Staff RAG: level 41, an experimental architecture over Qdrant.
 
-Стек:
-- Qdrant-oriented storage: основной backend уровня 41.
-- LightRAG-inspired graph layer: entity/relation graph поверх документов.
+Stack:
+- Qdrant-oriented storage: the main backend for level 41.
+- LightRAG-inspired graph layer: entity/relation graph over documents.
 - LlamaIndex-inspired ingestion: pdf/html/json/markdown/code + hierarchical chunking.
-- Parent-child chunks: большие чанки дают контекст, маленькие дают точный retrieval.
-- Metadata vectorization: в embedding уходит текст чанка + label + source_type.
-- Context expansion: соседние чанки добавляются только если cosine continuity выше порога.
+- Parent-child chunks: large chunks provide context, small chunks provide precise retrieval.
+- Metadata vectorization: embedding text includes chunk text + label + source_type.
+- Context expansion: neighboring chunks are added only when cosine continuity is above the threshold.
 - Router tool-map: vectorstore / web / summarise / translate / human pause / txt2sql.
-- HyDE перед retrieval: ищем не по грязному вопросу, а по псевдо-документу.
+- HyDE before retrieval: search against a pseudo-document instead of a noisy question.
 - Hybrid retrieval: cosine top_k=20 + BM25 top_k=20 -> merge.
-- Multi-reranker: BGE + Qwen3, затем RRF merge.
-- CatBoostRanker hook: включается только если есть достаточно labeled features.
+- Multi-reranker: BGE + Qwen3, then RRF merge.
+- CatBoostRanker hook: enabled only when enough labeled features exist.
 
-Архитектура специально сделана модульной: внешние Qdrant/LlamaIndex/LightRAG/
-CatBoost зависимости подключаются опционально, а локальный fallback оставляет файл
-рабочим учебным стендом без поднятой инфраструктуры.
+The architecture is intentionally modular: external Qdrant/LlamaIndex/LightRAG/
+CatBoost dependencies are optional, and the local fallback keeps this file
+usable as a learning sandbox without deployed infrastructure.
 """
 
 from __future__ import annotations
@@ -519,7 +519,7 @@ async def generate_hyde(question_text: str) -> str:
     return str(response.content)
 
 
-TOKEN_PATTERN = re.compile(r"[a-zA-Zа-яА-Я0-9_]+")
+TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 
 
 def tokenize(text_value: str) -> list[str]:
@@ -643,7 +643,7 @@ def repair_neighbor_navigation(index: StaffIndex, chunk: StaffChunk, direction: 
     if should_include_neighbor(chunk, direct_neighbor, direction):
         return direct_neighbor
 
-    # Если навигация страницы сбилась, проверяем через один чанк в том же parent.
+    # If page navigation is broken, check one chunk farther inside the same parent.
     offset = 2 if direction == "next" else -2
     repaired_index = chunk.chunk_index + offset
     if 0 <= repaired_index < len(index.chunks):

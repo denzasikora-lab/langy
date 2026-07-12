@@ -51,6 +51,8 @@ SOURCE_URLS = [
 ]
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+RETRIEVAL_TOP_K = 20
+RERANK_TOP_K = 3
 # endregion
 
 
@@ -84,11 +86,11 @@ def parse_json_response(response_content: Any) -> dict[str, Any]:
 
 
 def save_junior_diagram() -> None:
-    mermaid_text = """
+    mermaid_text = f"""
 flowchart TD
     q["User question"] --> r["InMemoryVectorStore retriever"]
-    r --> c["Default top-k chunks"]
-    c --> judge["LLM-as-a-judge reranker"]
+    r --> c["Top {RETRIEVAL_TOP_K} chunks"]
+    c --> judge["LLM-as-a-judge reranker: top {RERANK_TOP_K}"]
     judge --> m["Ollama via init_chat_model"]
     m --> json["JSON parsing"]
 """
@@ -182,7 +184,7 @@ Score means how useful this chunk is for answering the question.
         scored_documents.append((score_value, index_value, document))
 
     scored_documents.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-    return [document for _, _, document in scored_documents]
+    return [document for _, _, document in scored_documents[:RERANK_TOP_K]]
 
 
 def run_rag_junior(user_question: str) -> dict[str, Any]:
@@ -193,8 +195,7 @@ def run_rag_junior(user_question: str) -> dict[str, Any]:
     with ls.tracing_context(enabled=False):
         vectorstore = build_vectorstore()
 
-        # Do not pass k explicitly: LangChain retrievers default to k=4.
-        retriever = vectorstore.as_retriever()
+        retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVAL_TOP_K})
         retrieved_documents = retriever.invoke(user_question)
 
         llm = create_chat_model()

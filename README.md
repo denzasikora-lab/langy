@@ -57,9 +57,9 @@ USER_AGENT=langy-rag-junior/0.1
 
 `main.py` selects the RAG level by number:
 
-- `1` - junior, InMemoryVectorStore, JSON, default splitter settings
-- `21` - middle, Chroma + MMR, `k=3`, `fetch_k=10`, `lambda_mult=0.5`
-- `22` - middle, FAISS + MMR, `k=3`, `fetch_k=10`, `lambda_mult=0.5`
+- `1` - junior, InMemoryVectorStore, retrieve 20 candidates, rerank to 3, JSON
+- `21` - middle, Chroma + MMR, `fetch_k=20`, `k=10`, rerank `top_k=3`, `lambda_mult=0.5`
+- `22` - middle, FAISS + MMR, `fetch_k=20`, `k=10`, rerank `top_k=3`, `lambda_mult=0.5`
 - `31` - senior, Weaviate-oriented async LangGraph RAG
 - `32` - senior, Qdrant-oriented async LangGraph RAG with optional PostgreSQL/pgvector sync
 - `41` - staff, Qdrant-oriented LightRAG/LlamaIndex-style graph RAG
@@ -98,8 +98,8 @@ DEFAULT_LEVEL = 1
 4. Uses an LLM tool-calling router to choose `vectorstore_search` or `web_search`.
 5. Level `21` persists vectors in Chroma.
 6. Level `22` persists vectors in FAISS.
-7. Uses MMR for vectorstore retrieval: fetches 10 candidates and selects diverse candidates with `lambda_mult=0.5`.
-8. Reranks candidates using retrieval-vs-lexical weights selected against a tiny eval set.
+7. Uses MMR for vectorstore retrieval: fetches 20 candidates and selects 10 diverse candidates with `lambda_mult=0.5`.
+8. Reranks candidates using retrieval-vs-lexical weights selected against a tiny eval set, keeping the best 3.
 9. Reports `Recall@K`, `MRR`, `MAP`, and `nDCG` when the question is in the eval set.
 10. Uses `with_structured_output(...)` with a Pydantic schema.
 11. Calls OpenAI models through `init_chat_model(...)`.
@@ -113,7 +113,7 @@ DEFAULT_LEVEL = 1
 4. Builds ensemble embeddings from `BAAI/bge-m3` and `sentence-transformers/all-MiniLM-L6-v2`.
 5. Retrieves with semantic cosine search `top_k=20` and BM25 keyword search `top_k=20`.
 6. Merges semantic and BM25 candidates into a hybrid list.
-7. Reranks to `top_k=5` with `BAAI/bge-reranker-base`.
+7. Reranks to `top_k=3` with `BAAI/bge-reranker-base`.
 8. Grades documents with yes/no relevance.
 9. Falls back to web search if too few documents pass grading.
 10. Builds a controlled context for a model with a context window greater than 64k.
@@ -132,7 +132,7 @@ DEFAULT_LEVEL = 1
 8. Retrieves with cosine top_k=20 and BM25 top_k=20, then hybrid-merges candidates.
 9. Expands context through neighboring chunks only when cosine continuity is high enough.
 10. Repairs broken next/previous navigation by checking nearby chunks in the same parent.
-11. Reranks with BGE and Qwen3 rerankers, then merges both rankings.
+11. Reranks with BGE and Qwen3 rerankers, merges both rankings, and keeps the best 3.
 12. Uses CatBoostRanker only when enough labeled ranking data exists in `staff_ltr_training.json`.
 
 ## Diagrams

@@ -7,7 +7,7 @@ Stack:
 - PII anonymization: NER-like detector, regex filter, and synthetic masks.
 - HyDE: the LLM first writes a hypothetical document, then searches with it.
 - Hybrid retrieval: semantic cosine top_k=20 + BM25 top_k=20 -> merge.
-- Reranker: narrows candidates to top_k=5.
+- Reranker: narrows candidates to top_k=3.
 - Grader: verifies document relevance with yes/no decisions.
 - Fallback: web search when suitable documents are not found.
 - Context builder: assembles a controlled prompt context.
@@ -73,7 +73,7 @@ CHUNK_OVERLAP = 200
 SEMANTIC_TOP_K = 20
 BM25_TOP_K = 20
 HYBRID_TOP_K = 20
-RERANK_TOP_K = 5
+RERANK_TOP_K = 3
 MIN_GRADED_DOCS = 2
 SENIOR_CONTEXT_CHAR_BUDGET = 180_000
 MAX_CORRECTION_ATTEMPTS = 2
@@ -866,7 +866,7 @@ flowchart TD
     mcp --> pii["PII anonymization: NER + regex masks"]
     pii --> hyde["HyDE pseudo-document"]
     hyde --> ret["{store_label}: semantic top_k=20 + BM25 top_k=20"]
-    ret --> rerank["BAAI/bge-reranker-base top_k=5"]
+    ret --> rerank["BAAI/bge-reranker-base top_k=3"]
     rerank --> grade["Document grader yes/no"]
     grade -->|enough good docs| ctx["Context builder"]
     grade -->|not enough docs| fallback["Fallback web search"]
@@ -924,7 +924,7 @@ async def run_rag_senior(
             "semantic_top_20",
             "bm25_top_20",
             "hybrid_merge",
-            "bge_reranker_top_5",
+            "bge_reranker_top_3",
             "grader_yes_no",
             "fallback_web_search",
             "context_builder",

@@ -11,7 +11,7 @@ Stack:
 
 Architecture:
 - download pages -> split with overlap -> save to Chroma or FAISS;
-- MMR takes fetch_k=10 candidates and selects k=3 more distinct chunks;
+- MMR fetches 20 candidates and selects k=10 more distinct chunks;
 - lambda_mult=0.5 balances similarity and diversity;
 - LangGraph passes state between retrieve_context and generate_answer nodes;
 - the LLM returns an answer in the MiddleAnswer Pydantic schema.
@@ -79,8 +79,8 @@ RERANK_WEIGHT_GRID = [
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-MMR_K = 3
-MMR_FETCH_K = 10
+MMR_K = 10
+MMR_FETCH_K = 20
 MMR_LAMBDA_MULT = 0.5
 RERANK_TOP_K = 3
 WEB_SEARCH_TOP_K = 5
@@ -592,7 +592,7 @@ def save_graph_diagram(store: MiddleStore) -> None:
     mermaid_text = f"""
 flowchart TD
     q["User question"] --> router["LLM tool-calling router"]
-    router -->|vectorstore_search| vs["{store_label}: MMR fetch_k={MMR_FETCH_K}"]
+    router -->|vectorstore_search| vs["{store_label}: fetch_k={MMR_FETCH_K} -> MMR k={MMR_K}"]
     router -->|web_search| web["Web search tool"]
     vs --> rerank["Reranker top_k={RERANK_TOP_K} + eval metrics"]
     web --> rerank
@@ -621,7 +621,7 @@ def retrieve_with_chroma_mmr(user_question: str, *, rebuild_index: bool) -> list
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={
-            "k": MMR_FETCH_K,
+            "k": MMR_K,
             "fetch_k": MMR_FETCH_K,
             "lambda_mult": MMR_LAMBDA_MULT,
         },
@@ -633,7 +633,7 @@ def retrieve_with_faiss_mmr(user_question: str, *, rebuild_index: bool) -> list[
     faiss_bundle = build_or_load_faiss_bundle(rebuild=rebuild_index)
     documents = faiss_bundle.similarity_search_mmr(
         user_question,
-        k=MMR_FETCH_K,
+        k=MMR_K,
         fetch_k=MMR_FETCH_K,
         lambda_mult=MMR_LAMBDA_MULT,
     )
@@ -729,8 +729,8 @@ def run_rag_middle(
     ]
     result["retrieval_mode"] = f"{store}_mmr"
     result["mmr"] = {
-        "original_final_k": MMR_K,
-        "candidate_k_for_reranker": MMR_FETCH_K,
+        "k": MMR_K,
+        "candidate_k_for_reranker": MMR_K,
         "fetch_k": MMR_FETCH_K,
         "lambda_mult": MMR_LAMBDA_MULT,
     }

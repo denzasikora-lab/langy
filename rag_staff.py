@@ -68,7 +68,7 @@ CHILD_OVERLAP = 80
 SEMANTIC_TOP_K = 20
 BM25_TOP_K = 20
 HYBRID_TOP_K = 20
-RERANK_TOP_K = 8
+RERANK_TOP_K = 3
 FINAL_TOP_K = 5
 CONTEXT_CONTINUITY_THRESHOLD = 0.72
 CATBOOST_MIN_TRAINING_ROWS = 200
@@ -975,7 +975,7 @@ flowchart TD
     hyde --> ingest["LlamaIndex-style hierarchical ingestion"]
     ingest --> kg["LightRAG graph plus Qdrant vectors"]
     kg --> ret["Cosine top 20 plus BM25 top 20"]
-    ret --> rerank["BGE plus Qwen3 plus optional CatBoostRanker"]
+    ret --> rerank["BGE plus Qwen3 rerank top 3 plus optional CatBoostRanker"]
     rerank --> expand["Neighbor context expansion"]
     expand --> answer["Answer"]
 """

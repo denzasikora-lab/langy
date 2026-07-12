@@ -1,28 +1,28 @@
-"""Senior RAG: асинхронный production-shaped pipeline.
+"""Senior RAG: an asynchronous, production-shaped pipeline.
 
-Стек:
-- level 31: Weaviate-oriented режим.
-- level 32: Qdrant-oriented режим.
-- async/await: все публичные шаги pipeline асинхронные.
-- PII anonymization: NER-like detector + regex-фильтр + синтетические маски.
-- HyDE: LLM сначала пишет гипотетический документ, потом ищем по нему.
+Stack:
+- level 31: Weaviate-oriented mode.
+- level 32: Qdrant-oriented mode.
+- async/await: every public pipeline step is asynchronous.
+- PII anonymization: NER-like detector, regex filter, and synthetic masks.
+- HyDE: the LLM first writes a hypothetical document, then searches with it.
 - Hybrid retrieval: semantic cosine top_k=20 + BM25 top_k=20 -> merge.
-- Reranker: сужает кандидатов до top_k=5.
-- Grader: yes/no проверка релевантности документов.
-- Fallback: web search, если хорошие документы не найдены.
-- Context builder: собирает контролируемый prompt context.
-- LLM generation: ответ по большому context window > 64k.
+- Reranker: narrows candidates to top_k=5.
+- Grader: verifies document relevance with yes/no decisions.
+- Fallback: web search when suitable documents are not found.
+- Context builder: assembles a controlled prompt context.
+- LLM generation: answers with a large context window greater than 64k.
 - Hallucination grader + optional self-correction loop.
-- Embedding ensemble: BGE-M3 + MiniLM, нормализация и concat.
+- Embedding ensemble: BGE-M3 + MiniLM, normalization, and concatenation.
 
-Архитектура:
-- вопрос и документы сначала проходят anonymization;
-- HyDE превращает грязный вопрос пользователя в псевдо-документ для поиска;
-- ensemble embeddings строит более устойчивый semantic vector;
-- hybrid retriever объединяет смысловой поиск и keyword BM25;
-- reranker, grader и hallucination-check режут риск мусора и галлюцинаций;
-- Qdrant/Weaviate здесь оформлены как senior-режимы, а локальный hybrid engine
-  оставлен рабочим, чтобы пример запускался без поднятой внешней vector DB.
+Architecture:
+- anonymize the question and documents first;
+- use HyDE to turn a noisy user question into a pseudo-document for retrieval;
+- build a more robust semantic vector with ensemble embeddings;
+- combine semantic search and keyword BM25 in the hybrid retriever;
+- use the reranker, grader, and hallucination check to reduce irrelevant output and hallucinations;
+- expose Qdrant and Weaviate as senior modes while keeping a local hybrid engine
+  so that the example runs without an external vector database.
 """
 
 import asyncio
@@ -306,7 +306,7 @@ def detect_pii_spans(text: str) -> list[PiiSpan]:
     for label, pattern in PII_PATTERNS:
         spans.extend(PiiSpan(match.start(), match.end(), label) for match in pattern.finditer(text))
 
-    # Lightweight NER-like pass: ловим простые англоязычные имена вида "John Smith".
+    # Lightweight NER-like pass for simple English names such as "John Smith".
     spans.extend(PiiSpan(match.start(), match.end(), "PERSON") for match in PERSON_PATTERN.finditer(text))
     return merge_overlapping_spans(spans)
 
@@ -437,7 +437,7 @@ async def build_hybrid_index(store: SeniorStore) -> SeniorHybridIndex:
 
 
 # region ---------------- BM25 and hybrid merge ----------------
-TOKEN_PATTERN = re.compile(r"[a-zA-Zа-яА-Я0-9_]+")
+TOKEN_PATTERN = re.compile(r"\w+")
 
 
 def tokenize(text: str) -> list[str]:
@@ -567,7 +567,7 @@ async def rerank_candidates(question_text: str, candidates: list[RetrievalCandid
     try:
         rerank_scores = await asyncio.to_thread(rerank_sync)
     except Exception:
-        # Fallback остается детерминированным, если локальный reranker не скачался/не загрузился.
+        # Keep the fallback deterministic if the local reranker cannot be downloaded or loaded.
         query_terms = set(tokenize(question_text))
         rerank_scores = []
         for candidate in candidates:

@@ -1,17 +1,17 @@
-"""Junior RAG: самый простой учебный уровень.
+"""Junior RAG: the simplest instructional level.
 
-Стек:
-- InMemoryVectorStore: векторы живут только в памяти процесса.
-- sentence-transformers/all-MiniLM-L6-v2: локальные embeddings.
-- Ollama через init_chat_model: генерация ответа.
-- JSON без Pydantic: простая ручная проверка ответа.
+Stack:
+- InMemoryVectorStore: vectors live only in the process memory.
+- sentence-transformers/all-MiniLM-L6-v2: local embeddings.
+- Ollama through init_chat_model: answer generation.
+- JSON without Pydantic: simple manual response validation.
 
-Архитектура:
-- скачали страницы -> нарезали дефолтным splitter без тонкой настройки;
-- вопрос пользователя тоже превращается в вектор;
-- retriever сравнивает вектор вопроса с векторами чанков;
-- LLM-as-a-judge reranker сортирует найденные чанки по полезности;
-- лучшие чанки идут в LLM как контекст.
+Architecture:
+- download pages -> split them with the default splitter and no fine-tuning;
+- turn the user question into a vector as well;
+- compare the question vector with chunk vectors in the retriever;
+- use an LLM-as-a-judge reranker to order retrieved chunks by usefulness;
+- pass the best chunks to the LLM as context.
 """
 
 import json
@@ -112,14 +112,14 @@ def load_web_documents(source_urls: list[str]) -> list[Document]:
 
 
 def create_embeddings() -> HuggingFaceEmbeddings:
-    # Модель скачивается один раз в cache Hugging Face.
-    # При каждом новом запуске Python веса заново читаются из cache/диска в память.
+    # The model downloads once into the Hugging Face cache.
+    # Each Python run reloads the weights from the cache or disk into memory.
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, show_progress=False)
 
 
 def build_vectorstore() -> VectorStore:
     raw_documents = load_web_documents(SOURCE_URLS)
-    # Junior-уровень: не трогаем chunk_size/chunk_overlap, чтобы не смешивать темы.
+    # Keep the default chunk settings at this level to avoid mixing concepts.
     splitter = RecursiveCharacterTextSplitter()
     split_documents = splitter.split_documents(raw_documents)
     embeddings = create_embeddings()
@@ -193,7 +193,7 @@ def run_rag_junior(user_question: str) -> dict[str, Any]:
     with ls.tracing_context(enabled=False):
         vectorstore = build_vectorstore()
 
-        # k специально не передаем: у LangChain retriever по умолчанию k=4.
+        # Do not pass k explicitly: LangChain retrievers default to k=4.
         retriever = vectorstore.as_retriever()
         retrieved_documents = retriever.invoke(user_question)
 

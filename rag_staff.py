@@ -10,7 +10,7 @@
 - Router tool-map: vectorstore / web / summarise / translate / human pause / txt2sql.
 - HyDE перед retrieval: ищем не по грязному вопросу, а по псевдо-документу.
 - Hybrid retrieval: cosine top_k=20 + BM25 top_k=20 -> merge.
-- Multi-reranker: BGE + Qwen3, затем RRF merge.
+- Multi-reranker: BGE + Qwen3, optional ColBERT, optional LLM-as-a-reranker, затем RRF merge.
 - CatBoostRanker hook: включается только если есть достаточно labeled features.
 
 Архитектура специально сделана модульной: внешние Qdrant/LlamaIndex/LightRAG/
@@ -45,6 +45,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field
@@ -72,11 +73,23 @@ RERANK_TOP_K = 8
 FINAL_TOP_K = 5
 CONTEXT_CONTINUITY_THRESHOLD = 0.72
 CATBOOST_MIN_TRAINING_ROWS = 200
+AGENTIC_RERANKER_ENV = "STAFF_ENABLE_AGENTIC_RERANKER"
+COLBERT_RERANKER_ENV = "STAFF_ENABLE_COLBERT_RERANKER"
+LLM_RERANKER_ENV = "STAFF_ENABLE_LLM_RERANKER"
 
 BGE_M3_MODEL = "BAAI/bge-m3"
+GEMMA_EMBEDDING_MODEL = "embeddinggemma"
+# Multimodal: text, images, PDFs, charts; strong for visual RAG over documents,
+# screenshots, tables, diagrams, and chart-heavy pages.
+NOMIC_MULTIMODAL_MODEL = "nomic-ai/nomic-embed-multimodal-3b"
+# Multimodal: text, image, video, and visual documents; strong candidate for
+# retrieval over screenshots, videos, scanned pages, and mixed visual corpora.
+VLM2VEC_V2_MODEL = "VLM2Vec/VLM2Vec-V2.0"
 BGE_RERANKER_MODEL = "BAAI/bge-reranker-base"
 QWEN3_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+COLBERT_RERANKER_MODEL = "colbert-ir/colbertv2.0"
 StaffRoute = Literal["vectorstore", "web", "summarise", "translate", "human_pause", "txt2sql"]
+RerankStrategy = Literal["single_bge", "bge_qwen_ensemble", "colbert_augmented", "llm_augmented", "catboost_ltr"]
 AfterRouteNode = Literal[
     "generate_hyde",
     "web_search",
@@ -100,6 +113,21 @@ class StaffAnswer(BaseModel):
     model_confidence: float = Field(ge=0.0, le=1.0)
 
 
+class StaffRerankDecision(BaseModel):
+    ranked_chunk_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class StaffRerankPlan(BaseModel):
+    strategy: RerankStrategy = "bge_qwen_ensemble"
+    use_bge: bool = True
+    use_qwen: bool = True
+    use_colbert: bool = False
+    use_llm_reranker: bool = False
+    use_catboost: bool = False
+    reason: str = ""
+
+
 class StaffState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -111,6 +139,7 @@ class StaffState(BaseModel):
     chunks: list["StaffChunk"] = Field(default_factory=list)
     index: "StaffIndex | None" = None
     candidates: list["StaffCandidate"] = Field(default_factory=list)
+    rerank_plan: StaffRerankPlan | None = None
     expanded_candidates: list["StaffCandidate"] = Field(default_factory=list)
     context_text: str = ""
     answer: StaffAnswer | None = None
@@ -141,14 +170,54 @@ class StaffCandidate:
     hybrid_score: float = 0.0
     bge_rerank_score: float = 0.0
     qwen_rerank_score: float = 0.0
+    colbert_rerank_score: float | None = None
+    llm_rerank_score: float | None = None
     catboost_score: float | None = None
     final_score: float = 0.0
     features: dict[str, float | int | str] = field(default_factory=dict)
 
 
 @dataclass
+class StaffEmbeddingModel:
+    name: str
+    weight: float
+    embedding: Any
+    optional: bool = False
+    available: bool = True
+
+
+class OptionalHuggingFaceEmbedding:
+    """Best-effort text path for optional multimodal checkpoints.
+
+    Nomic handles text/images/PDFs/charts; VLM2Vec-V2 handles text/images/video
+    and visual documents. This adapter keeps staff runnable when those heavy
+    local model dependencies are not installed.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.embedding: HuggingFaceEmbeddings | None = None
+
+    def _load(self) -> HuggingFaceEmbeddings:
+        if self.embedding is None:
+            self.embedding = HuggingFaceEmbeddings(
+                model_name=self.model_name,
+                model_kwargs={"trust_remote_code": True},
+                show_progress=False,
+            )
+        return self.embedding
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._load().embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._load().embed_query(text)
+
+
+@dataclass
 class StaffIndex:
     chunks: list[StaffChunk]
+    embeddings: list[StaffEmbeddingModel]
     vectors: np.ndarray
     tokenized_chunks: list[list[str]]
     idf: dict[str, float]
@@ -156,8 +225,8 @@ class StaffIndex:
     chunk_by_id: dict[str, StaffChunk]
     graph_edges: dict[str, set[str]]
 
-    async def search(self, query_text: str, embeddings: HuggingFaceEmbeddings) -> list[StaffCandidate]:
-        query_vector = await embed_query(query_text, embeddings)
+    async def search(self, query_text: str) -> list[StaffCandidate]:
+        query_vector = await embed_query(query_text, self.embeddings)
         semantic_candidates = semantic_search(self, query_vector, SEMANTIC_TOP_K)
         bm25_candidates = bm25_search(self, query_text, BM25_TOP_K)
         return hybrid_merge(semantic_candidates, bm25_candidates, HYBRID_TOP_K)
@@ -187,8 +256,36 @@ def create_chat_model():
     )
 
 
-def create_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(model_name=BGE_M3_MODEL, show_progress=False)
+def create_embedding_models() -> list[StaffEmbeddingModel]:
+    return [
+        StaffEmbeddingModel(
+            name=GEMMA_EMBEDDING_MODEL,
+            weight=0.4,
+            embedding=OllamaEmbeddings(
+                model=os.environ.get("OLLAMA_EMBEDDING_MODEL", GEMMA_EMBEDDING_MODEL),
+                base_url=os.environ.get("OLLAMA_LOCAL_HOST", "http://localhost:11434"),
+            ),
+        ),
+        StaffEmbeddingModel(
+            name=BGE_M3_MODEL,
+            weight=0.4,
+            embedding=HuggingFaceEmbeddings(model_name=BGE_M3_MODEL, show_progress=False),
+        ),
+        # Optional multimodal: text, images, PDFs, charts, screenshots, visual documents.
+        StaffEmbeddingModel(
+            name=NOMIC_MULTIMODAL_MODEL,
+            weight=0.1,
+            embedding=OptionalHuggingFaceEmbedding(NOMIC_MULTIMODAL_MODEL),
+            optional=True,
+        ),
+        # Optional multimodal: text, image, video, and visual documents.
+        StaffEmbeddingModel(
+            name=VLM2VEC_V2_MODEL,
+            weight=0.1,
+            embedding=OptionalHuggingFaceEmbedding(VLM2VEC_V2_MODEL),
+            optional=True,
+        ),
+    ]
 # endregion
 
 
@@ -368,15 +465,37 @@ def normalize_vector(vector: np.ndarray) -> np.ndarray:
     return vector if norm == 0 else vector / norm
 
 
-async def embed_chunks(chunks: list[StaffChunk], embeddings: HuggingFaceEmbeddings) -> np.ndarray:
+async def embed_chunks(chunks: list[StaffChunk], embeddings: list[StaffEmbeddingModel]) -> np.ndarray:
     texts = [vectorized_text(chunk) for chunk in chunks]
-    vectors = await asyncio.to_thread(embeddings.embed_documents, texts)
-    return normalize_matrix(np.array(vectors, dtype="float32"))
+    vector_parts: list[np.ndarray] = []
+    for model in embeddings:
+        try:
+            vectors = await asyncio.to_thread(model.embedding.embed_documents, texts)
+        except Exception:
+            # Keep staff usable if a local or optional multimodal embedding backend is unavailable.
+            model.available = False
+            continue
+        vector_parts.append(normalize_matrix(np.array(vectors, dtype="float32")) * model.weight)
+    if not vector_parts:
+        raise RuntimeError("No staff embedding models were available for document embedding.")
+    return normalize_matrix(np.concatenate(vector_parts, axis=1))
 
 
-async def embed_query(query_text: str, embeddings: HuggingFaceEmbeddings) -> np.ndarray:
-    vector = await asyncio.to_thread(embeddings.embed_query, query_text)
-    return normalize_vector(np.array(vector, dtype="float32"))
+async def embed_query(query_text: str, embeddings: list[StaffEmbeddingModel]) -> np.ndarray:
+    vector_parts: list[np.ndarray] = []
+    for model in embeddings:
+        if not model.available:
+            continue
+        try:
+            vector = await asyncio.to_thread(model.embedding.embed_query, query_text)
+        except Exception:
+            # Keep staff usable if a local or optional multimodal embedding backend is unavailable.
+            model.available = False
+            continue
+        vector_parts.append(normalize_vector(np.array(vector, dtype="float32")) * model.weight)
+    if not vector_parts:
+        raise RuntimeError("No staff embedding models were available for query embedding.")
+    return normalize_vector(np.concatenate(vector_parts))
 
 
 def build_lightrag_graph(chunks: list[StaffChunk]) -> dict[str, set[str]]:
@@ -455,7 +574,7 @@ async def maybe_upload_to_qdrant(chunks: list[StaffChunk], vectors: np.ndarray) 
         return f"qdrant_unavailable:{type(error).__name__}"
 
 
-async def build_staff_index(documents: list[Document], embeddings: HuggingFaceEmbeddings) -> StaffIndex:
+async def build_staff_index(documents: list[Document], embeddings: list[StaffEmbeddingModel]) -> StaffIndex:
     chunks = hierarchical_chunk_documents(documents)
     vectors = await embed_chunks(chunks, embeddings)
     chunks = add_neighbor_cosines(chunks, vectors)
@@ -464,6 +583,7 @@ async def build_staff_index(documents: list[Document], embeddings: HuggingFaceEm
     avg_doc_length = sum(len(tokens) for tokens in tokenized_chunks) / max(len(tokenized_chunks), 1)
     return StaffIndex(
         chunks=chunks,
+        embeddings=embeddings,
         vectors=vectors,
         tokenized_chunks=tokenized_chunks,
         idf=idf,
@@ -670,8 +790,124 @@ def expand_context_with_neighbors(index: StaffIndex, candidates: list[StaffCandi
 # endregion
 
 
-# region ---------------- Rerankers: BGE + Qwen3 + optional CatBoostRanker ----------------
+# region ---------------- Rerankers: BGE + Qwen3 + optional ColBERT/LLM/CatBoost ----------------
 _RERANKERS: dict[str, Any] = {}
+
+
+def env_flag_enabled(env_name: str, default: bool = False) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is None or env_value == "":
+        return default
+    return env_value.lower() in {"1", "true", "yes"}
+
+
+def deterministic_rerank_plan(
+    question_text: str,
+    candidates: list[StaffCandidate],
+    training_rows: list[dict[str, Any]],
+) -> StaffRerankPlan:
+    question_terms = tokenize(question_text)
+    has_ltr_data = has_enough_ltr_data(training_rows)
+    allow_colbert = env_flag_enabled(COLBERT_RERANKER_ENV)
+    allow_llm = env_flag_enabled(LLM_RERANKER_ENV)
+    asks_for_reasoning = any(term in question_terms for term in {"compare", "why", "explain", "tradeoff", "architecture"})
+    has_visual_or_structured_sources = any(
+        candidate.chunk.source_type in {"pdf", "code", "markdown"} for candidate in candidates
+    )
+
+    use_qwen = len(candidates) >= 5
+    use_colbert = allow_colbert and (has_visual_or_structured_sources or len(candidates) >= 10)
+    use_llm = allow_llm and asks_for_reasoning and len(candidates) <= RERANK_TOP_K
+
+    strategy: RerankStrategy = "bge_qwen_ensemble" if use_qwen else "single_bge"
+    if use_colbert:
+        strategy = "colbert_augmented"
+    if use_llm:
+        strategy = "llm_augmented"
+    if has_ltr_data:
+        strategy = "catboost_ltr"
+
+    return StaffRerankPlan(
+        strategy=strategy,
+        use_bge=True,
+        use_qwen=use_qwen,
+        use_colbert=use_colbert,
+        use_llm_reranker=use_llm,
+        use_catboost=has_ltr_data,
+        reason="Deterministic fallback plan based on candidate count, optional tool flags, and LTR data availability.",
+    )
+
+
+def normalize_rerank_plan(plan: StaffRerankPlan, training_rows: list[dict[str, Any]]) -> StaffRerankPlan:
+    plan.use_colbert = plan.use_colbert and env_flag_enabled(COLBERT_RERANKER_ENV)
+    plan.use_llm_reranker = plan.use_llm_reranker and env_flag_enabled(LLM_RERANKER_ENV)
+    plan.use_catboost = plan.use_catboost and has_enough_ltr_data(training_rows)
+
+    has_neural_ranker = plan.use_bge or plan.use_qwen or plan.use_colbert or plan.use_llm_reranker
+    if not has_neural_ranker:
+        plan.use_bge = True
+        plan.strategy = "single_bge"
+        plan.reason = f"{plan.reason} Fallback forced BGE because no runnable reranker was selected.".strip()
+
+    if plan.use_catboost:
+        plan.strategy = "catboost_ltr"
+    elif plan.use_llm_reranker:
+        plan.strategy = "llm_augmented"
+    elif plan.use_colbert:
+        plan.strategy = "colbert_augmented"
+    elif plan.use_bge and plan.use_qwen:
+        plan.strategy = "bge_qwen_ensemble"
+    elif plan.use_bge:
+        plan.strategy = "single_bge"
+    return plan
+
+
+async def plan_reranker_tools(
+    question_text: str,
+    candidates: list[StaffCandidate],
+    training_rows: list[dict[str, Any]],
+) -> StaffRerankPlan:
+    fallback_plan = deterministic_rerank_plan(question_text, candidates, training_rows)
+    if not env_flag_enabled(AGENTIC_RERANKER_ENV, default=True):
+        return fallback_plan
+
+    try:
+        structured_model = create_chat_model().with_structured_output(StaffRerankPlan)
+        candidate_preview = "\n\n".join(
+            f"chunk_id: {candidate.chunk.chunk_id}\n"
+            f"source_type: {candidate.chunk.source_type}\n"
+            f"hybrid_score: {candidate.hybrid_score:.4f}\n"
+            f"text:\n{candidate.chunk.text[:700]}"
+            for candidate in candidates[:12]
+        )
+        prompt = f"""
+You are the agentic reranker planner for a RAG pipeline.
+Choose which reranker tools should run for this question and candidate set.
+
+Available tools:
+- BGE: always available; strong default cross-encoder reranker.
+- Qwen3: always available; useful as a second cross-encoder opinion.
+- ColBERT: allowed={env_flag_enabled(COLBERT_RERANKER_ENV)}; late-interaction reranker, useful for exact/token-level evidence.
+- LLM-as-a-reranker: allowed={env_flag_enabled(LLM_RERANKER_ENV)}; useful for ambiguous reasoning-heavy questions, but slower and costlier.
+- CatBoostRanker: allowed={has_enough_ltr_data(training_rows)}; use only with enough labeled ranking data.
+
+Rules:
+- Prefer BGE alone for tiny/simple candidate sets.
+- Prefer BGE+Qwen3 ensemble for general retrieval.
+- Add ColBERT when exact phrase/token evidence or structured documents matter.
+- Add LLM-as-a-reranker when semantic judgment is ambiguous and reasoning-heavy.
+- Add CatBoostRanker only when labeled learning-to-rank data exists.
+
+Question:
+{question_text}
+
+Candidates:
+{candidate_preview}
+"""
+        plan = await structured_model.ainvoke(prompt)
+        return normalize_rerank_plan(plan, training_rows)
+    except Exception:
+        return fallback_plan
 
 
 def predict_cross_encoder(model_name: str, question_text: str, candidates: list[StaffCandidate]) -> list[float]:
@@ -693,6 +929,53 @@ def predict_cross_encoder(model_name: str, question_text: str, candidates: list[
         return scores
 
 
+def predict_colbert_scores(question_text: str, candidates: list[StaffCandidate]) -> list[float] | None:
+    try:
+        from ragatouille import RAGPretrainedModel
+
+        reranker = _RERANKERS.get(COLBERT_RERANKER_MODEL)
+        if reranker is None:
+            reranker = RAGPretrainedModel.from_pretrained(COLBERT_RERANKER_MODEL)
+            _RERANKERS[COLBERT_RERANKER_MODEL] = reranker
+
+        documents = [candidate.chunk.text[:4000] for candidate in candidates]
+        results = reranker.rerank(query=question_text, documents=documents, k=len(documents))
+        scores_by_text = {
+            str(result.get("content", "")): float(result.get("score", 0.0))
+            for result in results
+            if isinstance(result, dict)
+        }
+        return [scores_by_text.get(document_text, 0.0) for document_text in documents]
+    except Exception:
+        return None
+
+
+async def predict_llm_ranking(question_text: str, candidates: list[StaffCandidate]) -> list[str] | None:
+    try:
+        structured_model = create_chat_model().with_structured_output(StaffRerankDecision)
+        candidate_blocks = "\n\n".join(
+            f"chunk_id: {candidate.chunk.chunk_id}\n"
+            f"source: {candidate.chunk.source}\n"
+            f"text:\n{candidate.chunk.text[:1800]}"
+            for candidate in candidates
+        )
+        prompt = f"""
+Rank these chunks by usefulness for answering the question.
+Return only chunk IDs that are present in the input.
+
+Question:
+{question_text}
+
+Chunks:
+{candidate_blocks}
+"""
+        decision = await structured_model.ainvoke(prompt)
+        known_ids = {candidate.chunk.chunk_id for candidate in candidates}
+        return [chunk_id for chunk_id in decision.ranked_chunk_ids if chunk_id in known_ids]
+    except Exception:
+        return None
+
+
 def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
     scores: dict[str, float] = {}
     for ranking in rankings:
@@ -701,25 +984,79 @@ def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60) -> dict[str, 
     return scores
 
 
-async def rerank_with_bge_qwen(question_text: str, candidates: list[StaffCandidate]) -> list[StaffCandidate]:
-    bge_scores, qwen_scores = await asyncio.gather(
-        asyncio.to_thread(predict_cross_encoder, BGE_RERANKER_MODEL, question_text, candidates),
-        asyncio.to_thread(predict_cross_encoder, QWEN3_RERANKER_MODEL, question_text, candidates),
-    )
+async def rerank_with_ensemble(
+    question_text: str,
+    candidates: list[StaffCandidate],
+    plan: StaffRerankPlan,
+) -> list[StaffCandidate]:
+    tool_calls: list[tuple[str, Any]] = []
+    if plan.use_bge:
+        tool_calls.append(("bge", asyncio.to_thread(predict_cross_encoder, BGE_RERANKER_MODEL, question_text, candidates)))
+    if plan.use_qwen:
+        tool_calls.append(("qwen", asyncio.to_thread(predict_cross_encoder, QWEN3_RERANKER_MODEL, question_text, candidates)))
+    if plan.use_colbert:
+        tool_calls.append(("colbert", asyncio.to_thread(predict_colbert_scores, question_text, candidates)))
+    if plan.use_llm_reranker:
+        tool_calls.append(("llm", predict_llm_ranking(question_text, candidates)))
 
-    for candidate, bge_score, qwen_score in zip(candidates, bge_scores, qwen_scores, strict=False):
-        candidate.bge_rerank_score = bge_score
-        candidate.qwen_rerank_score = qwen_score
+    tool_results = await asyncio.gather(*(tool_call for _, tool_call in tool_calls))
+    result_by_tool = {
+        tool_name: tool_result
+        for (tool_name, _), tool_result in zip(tool_calls, tool_results, strict=False)
+    }
 
-    bge_ranking = [
-        candidate.chunk.chunk_id
-        for candidate in sorted(candidates, key=lambda item: item.bge_rerank_score, reverse=True)
-    ]
-    qwen_ranking = [
-        candidate.chunk.chunk_id
-        for candidate in sorted(candidates, key=lambda item: item.qwen_rerank_score, reverse=True)
-    ]
-    rrf_scores = reciprocal_rank_fusion([bge_ranking, qwen_ranking])
+    rankings: list[list[str]] = []
+
+    bge_scores = result_by_tool.get("bge")
+    if isinstance(bge_scores, list):
+        for candidate, bge_score in zip(candidates, bge_scores, strict=False):
+            candidate.bge_rerank_score = float(bge_score)
+        rankings.append(
+            [
+                candidate.chunk.chunk_id
+                for candidate in sorted(candidates, key=lambda item: item.bge_rerank_score, reverse=True)
+            ]
+        )
+
+    qwen_scores = result_by_tool.get("qwen")
+    if isinstance(qwen_scores, list):
+        for candidate, qwen_score in zip(candidates, qwen_scores, strict=False):
+            candidate.qwen_rerank_score = float(qwen_score)
+        rankings.append(
+            [
+                candidate.chunk.chunk_id
+                for candidate in sorted(candidates, key=lambda item: item.qwen_rerank_score, reverse=True)
+            ]
+        )
+
+    colbert_scores = result_by_tool.get("colbert")
+    if isinstance(colbert_scores, list):
+        for candidate, colbert_score in zip(candidates, colbert_scores, strict=False):
+            candidate.colbert_rerank_score = float(colbert_score)
+        rankings.append(
+            [
+                candidate.chunk.chunk_id
+                for candidate in sorted(candidates, key=lambda item: item.colbert_rerank_score or 0.0, reverse=True)
+            ]
+        )
+
+    llm_ranking = result_by_tool.get("llm")
+    if isinstance(llm_ranking, list) and llm_ranking:
+        llm_positions = {chunk_id: rank_index for rank_index, chunk_id in enumerate(llm_ranking, start=1)}
+        for candidate in candidates:
+            if candidate.chunk.chunk_id in llm_positions:
+                candidate.llm_rerank_score = 1.0 / llm_positions[candidate.chunk.chunk_id]
+        rankings.append(llm_ranking)
+
+    if not rankings:
+        rankings.append(
+            [
+                candidate.chunk.chunk_id
+                for candidate in sorted(candidates, key=lambda item: item.hybrid_score, reverse=True)
+            ]
+        )
+
+    rrf_scores = reciprocal_rank_fusion(rankings)
     for candidate in candidates:
         candidate.final_score = rrf_scores.get(candidate.chunk.chunk_id, 0.0)
     return sorted(candidates, key=lambda item: item.final_score, reverse=True)[:RERANK_TOP_K]
@@ -864,7 +1201,7 @@ def build_staff_graph() -> CompiledStateGraph:
         return {"route": decision.route, "route_reason": decision.reason}
 
     async def load_and_index_node(state: StaffState) -> dict[str, Any]:
-        embeddings = create_embeddings()
+        embeddings = create_embedding_models()
         documents = await load_staff_documents()
         index = await build_staff_index(documents, embeddings)
         qdrant_status = await maybe_upload_to_qdrant(index.chunks, index.vectors)
@@ -876,13 +1213,20 @@ def build_staff_graph() -> CompiledStateGraph:
     async def retrieve_node(state: StaffState) -> dict[str, Any]:
         if state.index is None:
             raise RuntimeError("Staff index is required before retrieval")
-        embeddings = create_embeddings()
-        candidates = await state.index.search(state.hyde_text, embeddings)
+        candidates = await state.index.search(state.hyde_text)
         return {"candidates": candidates}
 
+    async def plan_rerank_node(state: StaffState) -> dict[str, Any]:
+        training_rows = load_ltr_training_rows()
+        plan = await plan_reranker_tools(state.question, state.candidates, training_rows)
+        return {"rerank_plan": plan}
+
     async def rerank_node(state: StaffState) -> dict[str, Any]:
-        candidates = await rerank_with_bge_qwen(state.question, state.candidates)
-        candidates = maybe_apply_catboost_ranker(candidates, load_ltr_training_rows())
+        training_rows = load_ltr_training_rows()
+        plan = state.rerank_plan or deterministic_rerank_plan(state.question, state.candidates, training_rows)
+        candidates = await rerank_with_ensemble(state.question, state.candidates, plan)
+        if plan.use_catboost:
+            candidates = maybe_apply_catboost_ranker(candidates, training_rows)
         return {"candidates": candidates}
 
     async def expand_context_node(state: StaffState) -> dict[str, Any]:
@@ -914,6 +1258,7 @@ def build_staff_graph() -> CompiledStateGraph:
     graph_builder.add_node("load_and_index", load_and_index_node)
     graph_builder.add_node("generate_hyde", hyde_node)
     graph_builder.add_node("retrieve_hybrid", retrieve_node)
+    graph_builder.add_node("plan_rerank_tools", plan_rerank_node)
     graph_builder.add_node("rerank_multi", rerank_node)
     graph_builder.add_node("expand_context", expand_context_node)
     graph_builder.add_node("answer", answer_node)
@@ -938,7 +1283,8 @@ def build_staff_graph() -> CompiledStateGraph:
     )
     graph_builder.add_edge("generate_hyde", "load_and_index")
     graph_builder.add_edge("load_and_index", "retrieve_hybrid")
-    graph_builder.add_edge("retrieve_hybrid", "rerank_multi")
+    graph_builder.add_edge("retrieve_hybrid", "plan_rerank_tools")
+    graph_builder.add_edge("plan_rerank_tools", "rerank_multi")
     graph_builder.add_edge("rerank_multi", "expand_context")
     graph_builder.add_edge("expand_context", "answer")
     graph_builder.add_edge("answer", END)
@@ -975,7 +1321,8 @@ flowchart TD
     hyde --> ingest["LlamaIndex-style hierarchical ingestion"]
     ingest --> kg["LightRAG graph plus Qdrant vectors"]
     kg --> ret["Cosine top 20 plus BM25 top 20"]
-    ret --> rerank["BGE plus Qwen3 plus optional CatBoostRanker"]
+    ret --> plan["Agentic reranker tool planner"]
+    plan --> rerank["Selected reranker tools plus RRF/CatBoost"]
     rerank --> expand["Neighbor context expansion"]
     expand --> answer["Answer"]
 """
@@ -990,6 +1337,8 @@ async def run_rag_staff(user_question: str) -> dict[str, Any]:
     result_state = await graph.ainvoke({"question": user_question})
     answer = result_state.get("answer") or StaffAnswer(answer="No answer produced.", sources=[], model_confidence=0.0)
     candidates = result_state.get("expanded_candidates") or result_state.get("candidates", [])
+    rerank_plan = result_state.get("rerank_plan")
+    index = result_state.get("index") or StaffIndex([], [], np.array([]), [], {}, 0.0, {}, {})
 
     return {
         **answer.model_dump(),
@@ -998,7 +1347,8 @@ async def run_rag_staff(user_question: str) -> dict[str, Any]:
         "route": result_state.get("route"),
         "route_reason": result_state.get("route_reason"),
         "hyde_preview": result_state.get("hyde_text", "")[:500],
-        "lightrag_graph_nodes": len((result_state.get("index") or StaffIndex([], np.array([]), [], {}, 0.0, {}, {})).graph_edges),
+        "rerank_plan": rerank_plan.model_dump() if isinstance(rerank_plan, StaffRerankPlan) else None,
+        "lightrag_graph_nodes": len(index.graph_edges),
         "llamaindex_hierarchical_available": llamaindex_hierarchical_available(),
         "retrieved_sources": list(dict.fromkeys(candidate.chunk.source for candidate in candidates)),
         "retrieved_chunk_ids": [candidate.chunk.chunk_id for candidate in candidates[:FINAL_TOP_K]],

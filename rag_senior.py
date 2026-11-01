@@ -13,7 +13,7 @@
 - Context builder: собирает контролируемый prompt context.
 - LLM generation: ответ по большому context window > 64k.
 - Hallucination grader + optional self-correction loop.
-- Embedding ensemble: BGE-M3 + MiniLM, нормализация и concat.
+- Embedding ensemble: local Ollama/Gemma + BGE-M3 + optional multimodal candidates.
 
 Архитектура:
 - вопрос и документы сначала проходят anonymization;
@@ -50,6 +50,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -79,7 +80,13 @@ SENIOR_CONTEXT_CHAR_BUDGET = 180_000
 MAX_CORRECTION_ATTEMPTS = 2
 
 BGE_M3_MODEL = "BAAI/bge-m3"
-MINILM_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GEMMA_EMBEDDING_MODEL = "embeddinggemma"
+# Multimodal: text, images, PDFs, charts; strong for visual RAG over documents,
+# screenshots, tables, diagrams, and chart-heavy pages.
+NOMIC_MULTIMODAL_MODEL = "nomic-ai/nomic-embed-multimodal-3b"
+# Multimodal: text, image, video, and visual documents; strong candidate for
+# retrieval over screenshots, videos, scanned pages, and mixed visual corpora.
+VLM2VEC_V2_MODEL = "VLM2Vec/VLM2Vec-V2.0"
 RERANKER_MODEL = "BAAI/bge-reranker-base"
 SeniorStore = Literal["qdrant", "weaviate"]
 AfterGradingNode = Literal["fallback_web_search", "build_context"]
@@ -136,7 +143,37 @@ class RetrievalCandidate:
 class EmbeddingModel:
     name: str
     weight: float
-    embedding: HuggingFaceEmbeddings
+    embedding: Any
+    optional: bool = False
+    available: bool = True
+
+
+class OptionalHuggingFaceEmbedding:
+    """Best-effort text path for optional multimodal checkpoints.
+
+    These models are designed for multimodal inputs. This adapter keeps them in
+    the ensemble config without making the whole senior pipeline hard-fail when
+    the local machine lacks GPU/dependencies/custom model code.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.embedding: HuggingFaceEmbeddings | None = None
+
+    def _load(self) -> HuggingFaceEmbeddings:
+        if self.embedding is None:
+            self.embedding = HuggingFaceEmbeddings(
+                model_name=self.model_name,
+                model_kwargs={"trust_remote_code": True},
+                show_progress=False,
+            )
+        return self.embedding
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._load().embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._load().embed_query(text)
 
 
 @dataclass
@@ -306,7 +343,7 @@ def detect_pii_spans(text: str) -> list[PiiSpan]:
     for label, pattern in PII_PATTERNS:
         spans.extend(PiiSpan(match.start(), match.end(), label) for match in pattern.finditer(text))
 
-    # Lightweight NER-like pass: ловим простые англоязычные имена вида "John Smith".
+    # Lightweight NER-like pass for simple English names such as "John Smith".
     spans.extend(PiiSpan(match.start(), match.end(), "PERSON") for match in PERSON_PATTERN.finditer(text))
     return merge_overlapping_spans(spans)
 
@@ -373,14 +410,31 @@ async def create_embedding_models() -> list[EmbeddingModel]:
     def create_models_sync() -> list[EmbeddingModel]:
         return [
             EmbeddingModel(
-                name=BGE_M3_MODEL,
-                weight=0.7,
-                embedding=HuggingFaceEmbeddings(model_name=BGE_M3_MODEL, show_progress=False),
+                name=GEMMA_EMBEDDING_MODEL,
+                weight=0.5,
+                embedding=OllamaEmbeddings(
+                    model=os.environ.get("OLLAMA_EMBEDDING_MODEL", GEMMA_EMBEDDING_MODEL),
+                    base_url=os.environ.get("OLLAMA_LOCAL_HOST", "http://localhost:11434"),
+                ),
             ),
             EmbeddingModel(
-                name=MINILM_MODEL,
-                weight=0.3,
-                embedding=HuggingFaceEmbeddings(model_name=MINILM_MODEL, show_progress=False),
+                name=BGE_M3_MODEL,
+                weight=0.5,
+                embedding=HuggingFaceEmbeddings(model_name=BGE_M3_MODEL, show_progress=False),
+            ),
+            # Optional multimodal: text, images, PDFs, charts, screenshots, visual documents.
+            EmbeddingModel(
+                name=NOMIC_MULTIMODAL_MODEL,
+                weight=0.25,
+                embedding=OptionalHuggingFaceEmbedding(NOMIC_MULTIMODAL_MODEL),
+                optional=True,
+            ),
+            # Optional multimodal: text, image, video, and visual documents.
+            EmbeddingModel(
+                name=VLM2VEC_V2_MODEL,
+                weight=0.25,
+                embedding=OptionalHuggingFaceEmbedding(VLM2VEC_V2_MODEL),
+                optional=True,
             ),
         ]
 
@@ -402,18 +456,34 @@ async def embed_ensemble_documents(documents: list[Document], embeddings: list[E
     texts = [document.page_content for document in documents]
     vector_parts: list[np.ndarray] = []
     for model in embeddings:
-        vectors = await asyncio.to_thread(model.embedding.embed_documents, texts)
+        try:
+            vectors = await asyncio.to_thread(model.embedding.embed_documents, texts)
+        except Exception:
+            # Keep the senior pipeline usable if a local embedding service is temporarily unavailable.
+            model.available = False
+            continue
         matrix = normalize_matrix(np.array(vectors, dtype="float32"))
         vector_parts.append(matrix * model.weight)
+    if not vector_parts:
+        raise RuntimeError("No embedding models were available for document embedding.")
     return normalize_matrix(np.concatenate(vector_parts, axis=1))
 
 
 async def embed_ensemble_query(query_text: str, embeddings: list[EmbeddingModel]) -> np.ndarray:
     vector_parts: list[np.ndarray] = []
     for model in embeddings:
-        vector = await asyncio.to_thread(model.embedding.embed_query, query_text)
+        if not model.available:
+            continue
+        try:
+            vector = await asyncio.to_thread(model.embedding.embed_query, query_text)
+        except Exception:
+            # Keep the senior pipeline usable if a local embedding service is temporarily unavailable.
+            model.available = False
+            continue
         normalized = normalize_vector(np.array(vector, dtype="float32"))
         vector_parts.append(normalized * model.weight)
+    if not vector_parts:
+        raise RuntimeError("No embedding models were available for query embedding.")
     return normalize_vector(np.concatenate(vector_parts))
 
 
@@ -567,7 +637,7 @@ async def rerank_candidates(question_text: str, candidates: list[RetrievalCandid
     try:
         rerank_scores = await asyncio.to_thread(rerank_sync)
     except Exception:
-        # Fallback остается детерминированным, если локальный reranker не скачался/не загрузился.
+        # Fallback stays deterministic if the local reranker is not downloaded or loaded.
         query_terms = set(tokenize(question_text))
         rerank_scores = []
         for candidate in candidates:

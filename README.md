@@ -5,7 +5,7 @@ Langy is a small RAG playground that grows in four steps:
 - `rag_junior.py` - level `1`, InMemoryVectorStore, default splitter settings, LLM-as-a-judge reranker, JSON parsing, and Ollama via `init_chat_model`.
 - `rag_middle.py` - level `21`, Chroma + MMR; level `22`, FAISS + MMR. Both use LangGraph router, simple tool calling, vectorstore/web-search branches, rerank eval metrics, Pydantic outputs, LangSmith, and OpenAI via `init_chat_model`.
 - `rag_senior.py` - level `31`, Weaviate-oriented async senior graph; level `32`, Qdrant-oriented async senior graph with optional PostgreSQL/pgvector sync. Both use optional MCP tools, PII anonymization, HyDE, hybrid retrieval, BGE reranking, graders, fallback, hallucination checks, loops, and embedding ensembling.
-- `rag_staff.py` - level `41`, staff RAG over Qdrant with LightRAG-style graph retrieval, LlamaIndex-style hierarchical ingestion, tool-map routing, context expansion, BGE+Qwen reranking, and optional CatBoostRanker.
+- `rag_staff.py` - level `41`, staff RAG over Qdrant with LightRAG-style graph retrieval, LlamaIndex-style hierarchical ingestion, tool-map routing, context expansion, agentic reranker tool selection, BGE+Qwen reranking, optional ColBERT/LLM reranking, and optional CatBoostRanker.
 
 ## Current Status
 
@@ -50,8 +50,13 @@ QDRANT_API_KEY=
 QDRANT_COLLECTION=langy_staff_41
 POSTGRES_CONNECTION_STRING=
 LANGY_PGVECTOR_COLLECTION=langy_senior_32
+STAFF_ENABLE_AGENTIC_RERANKER=true
+STAFF_ENABLE_COLBERT_RERANKER=false
+STAFF_ENABLE_LLM_RERANKER=false
 USER_AGENT=langy-rag-junior/0.1
 ```
+
+`STAFF_ENABLE_COLBERT_RERANKER=true` requires an optional ColBERT runtime such as `ragatouille`.
 
 ## Run
 
@@ -82,7 +87,7 @@ DEFAULT_LEVEL = 1
 1. Downloads a few source articles.
 2. Extracts clean text with BeautifulSoup.
 3. Splits text with the default LangChain splitter settings.
-4. Embeds chunks with `sentence-transformers/all-MiniLM-L6-v2`.
+4. Embeds chunks with `sentence-transformers/all-MiniLM-L6-v2`, a fast 384-dimensional English-first baseline. It works worse for non-English and multilingual retrieval.
 5. Stores vectors in memory only.
 6. Embeds the user question.
 7. Compares the question vector with document vectors.
@@ -110,7 +115,7 @@ DEFAULT_LEVEL = 1
 1. Boots optional MCP tools from `LANGY_MCP_CONNECTIONS_JSON`.
 2. Anonymizes PII with regex filters and a lightweight NER-like person detector.
 3. Uses HyDE: the LLM writes a hypothetical document that should answer the question.
-4. Builds ensemble embeddings from `BAAI/bge-m3` and `sentence-transformers/all-MiniLM-L6-v2`.
+4. Builds ensemble embeddings with local Ollama/Gemma embeddings, `BAAI/bge-m3`, and optional multimodal candidates: Nomic for text/images/PDFs/charts and VLM2Vec-V2 for text/images/video/visual documents.
 5. Retrieves with semantic cosine search `top_k=20` and BM25 keyword search `top_k=20`.
 6. Merges semantic and BM25 candidates into a hybrid list.
 7. Reranks to `top_k=5` with `BAAI/bge-reranker-base`.
@@ -126,14 +131,14 @@ DEFAULT_LEVEL = 1
 2. Uses HyDE before retrieval so semantic search runs against a cleaner hypothetical target document.
 3. Loads html/json/markdown/code/pdf documents.
 4. Builds parent-child hierarchical chunks: large parent chunks preserve context; small child chunks improve retrieval precision.
-5. Vectorizes chunk text together with metadata labels and source type.
+5. Vectorizes chunk text together with metadata labels and source type using local Gemma, `BAAI/bge-m3`, and optional multimodal Nomic/VLM2Vec-V2 candidates.
 6. Builds a LightRAG-style entity graph over chunks.
 7. Uploads vectors to Qdrant when `QDRANT_URL` is configured, otherwise uses the local fallback index.
 8. Retrieves with cosine top_k=20 and BM25 top_k=20, then hybrid-merges candidates.
 9. Expands context through neighboring chunks only when cosine continuity is high enough.
 10. Repairs broken next/previous navigation by checking nearby chunks in the same parent.
-11. Reranks with BGE and Qwen3 rerankers, then merges both rankings.
-12. Uses CatBoostRanker only when enough labeled ranking data exists in `staff_ltr_training.json`.
+11. Plans reranker tools agentically with structured output: single BGE, BGE+Qwen ensemble, optional ColBERT, optional LLM-as-a-reranker, and optional CatBoost.
+12. Executes selected reranker tools, merges ranking signals with RRF, and applies CatBoostRanker only when enough labeled ranking data exists in `staff_ltr_training.json`.
 
 ## Diagrams
 

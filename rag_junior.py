@@ -2,7 +2,7 @@
 
 Стек:
 - InMemoryVectorStore: векторы живут только в памяти процесса.
-- sentence-transformers/all-MiniLM-L6-v2: локальные embeddings.
+- sentence-transformers/all-MiniLM-L6-v2: fast English-first local embeddings.
 - Ollama через init_chat_model: генерация ответа.
 - JSON без Pydantic: простая ручная проверка ответа.
 
@@ -51,6 +51,9 @@ SOURCE_URLS = [
 ]
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# MiniLM produces 384-dimensional embeddings and works well as a fast English-first baseline.
+# It is weaker for non-English and multilingual retrieval; use BAAI/bge-m3 for that.
+# EMBEDDING_MODEL = "BAAI/bge-m3"
 # endregion
 
 
@@ -112,14 +115,14 @@ def load_web_documents(source_urls: list[str]) -> list[Document]:
 
 
 def create_embeddings() -> HuggingFaceEmbeddings:
-    # Модель скачивается один раз в cache Hugging Face.
-    # При каждом новом запуске Python веса заново читаются из cache/диска в память.
+    # The model downloads once into the Hugging Face cache.
+    # Each new Python run still reloads cached weights from disk into memory.
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, show_progress=False)
 
 
 def build_vectorstore() -> VectorStore:
     raw_documents = load_web_documents(SOURCE_URLS)
-    # Junior-уровень: не трогаем chunk_size/chunk_overlap, чтобы не смешивать темы.
+    # Junior level: keep chunk_size/chunk_overlap at defaults to avoid mixing concepts.
     splitter = RecursiveCharacterTextSplitter()
     split_documents = splitter.split_documents(raw_documents)
     embeddings = create_embeddings()
@@ -181,6 +184,7 @@ Score means how useful this chunk is for answering the question.
             score_value = 0.0
         scored_documents.append((score_value, index_value, document))
 
+    print(scored_documents)
     scored_documents.sort(key=lambda item: (item[0], -item[1]), reverse=True)
     return [document for _, _, document in scored_documents]
 
@@ -193,9 +197,18 @@ def run_rag_junior(user_question: str) -> dict[str, Any]:
     with ls.tracing_context(enabled=False):
         vectorstore = build_vectorstore()
 
-        # k специально не передаем: у LangChain retriever по умолчанию k=4.
+        # k is intentionally omitted: LangChain retriever default is k=4.
         retriever = vectorstore.as_retriever()
         retrieved_documents = retriever.invoke(user_question)
+
+        print("\n--- RETRIEVED CHUNKS DEBUG ---")
+
+        for i, doc in enumerate(retrieved_documents, start=1):
+            print(f"\nCHUNK #{i}")
+            print("SOURCE:", doc.metadata.get("source"))
+            print("TEXT_LEN:", len(doc.page_content))
+            # print("TEXT_START:", doc.page_content[:700])
+            # print("TEXT_END:", doc.page_content[-300:])
 
         llm = create_chat_model()
         reranked_documents = rerank_with_llm_judge(
